@@ -1,0 +1,24 @@
+# RoboMaster 2026 雷达射频系统 - Python 依赖
+# 安装: pip install -r requirements.txt
+
+# ── 核心 DSP ──────────────────────────────────────────────────────────────────
+numpy>=1.24.0
+scipy>=1.10.0
+
+# ── PlutoSDR / ADALM-PLUTO (Module 2, 3 及 rx_pluto_pipeline.py) ─────────────
+pyadi-iio>=0.0.14    # PlutoSDR driver — pip install pyadi-iio
+# libiio 必须在系统层面安装:
+#   Windows: 安装随 ADALM-PLUTO 附带的 IIO Oscilloscope（来自 analog.com）
+#   Linux:   sudo apt install libiio0 libiio-dev python3-libiio
+
+# ── GUI Dashboard (Module 5 — visual_terminal.py) ─────────────────────────────
+PyQt5>=5.15.0        # Qt5 bindings
+pyqtgraph>=0.13.0    # real-time plot widgets
+
+# ── RTL-SDR 支持 (rx_4fsk_pipeline.py 参考版本：软件仿真 + RTL-SDR 硬件) ─────
+# 仅在使用 RTL-SDR 硬件 RX 时需要；Pluto RX 不需要此包
+pyrtlsdr>=0.2.92
+# Windows 还需要 librtlsdr.dll + libusb-1.0.dll 放在脚本目录下
+
+# ── 可选：JIT 加速（大数据量时 DSP 吞吐不足时启用） ─────────────────────────
+# numba>=0.57.0

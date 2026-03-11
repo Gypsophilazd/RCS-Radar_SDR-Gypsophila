@@ -1,0 +1,10 @@
+{
+  "_comment": "RCS-Radar-SDR Arena Configuration — RM2026 Rulebook V1.3.0",
+  "team_color": "blue",
+  "target_jammer_level": 0,
+  "pluto_uri": "ip:pluto.local",
+  "pluto_rx_uri": "ip:pluto.local",
+  "rx_gain_db": 50,
+  "tx_attenuation_db": 0,
+  "rx_buf_size": 262144
+}
