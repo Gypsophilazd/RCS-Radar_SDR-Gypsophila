@@ -620,8 +620,17 @@ def run_pluto_rx(on_frame=None, rx_gain_db: int = RX_GAIN_DB,
                     warn = "  ⚠ ADC SATURATION — reduce rx_gain_db"
                 else:
                     warn = ""
+                # Quick FM demod on raw IQ — carrier offset indicator
+                # fm_mean ≈ 0 kHz   : no carrier offset  (✓ good)
+                # fm_mean >> ±83 kHz : offset → slicing errors
+                # fm_std  ≈ 100–300 kHz: consistent with 4-FSK signal
+                # fm_std  <  30 kHz : CW or noise (no 4-FSK modulation)
+                _fm = np.angle(iq[1:] * np.conj(iq[:-1])) * (SAMPLE_RATE / (2 * np.pi))
+                fm_mean_khz = float(_fm.mean()) / 1e3
+                fm_std_khz  = float(_fm.std())  / 1e3
                 print(f"[DBG cb={_cb_count[0]:3d}]  "
-                      f"IQ_RMS={iq_rms:.4f}  frames={_frame_count[0]}{warn}",
+                      f"IQ_RMS={iq_rms:.4f}  frames={_frame_count[0]}{warn}  "
+                      f"FM: μ={fm_mean_khz:+.1f}kHz σ={fm_std_khz:.0f}kHz",
                       flush=True)
     except KeyboardInterrupt:
         pass
@@ -631,6 +640,140 @@ def run_pluto_rx(on_frame=None, rx_gain_db: int = RX_GAIN_DB,
         except Exception:
             pass
         print("\n[PLUTO-RX] Stopped.")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 13b. Pluto RX Diagnostic Mode  (输出 DSP 链内部详细状态)
+# ═══════════════════════════════════════════════════════════════
+def run_pluto_diagnose(rx_gain_db: int = RX_GAIN_DB,
+                      rx_uri: str = PLUTO_RX_URI,
+                      n_blocks: int = 24):
+    """
+    Capture n_blocks of IQ and print a complete DSP-chain diagnostic.
+    Run with: python rx_pluto_pipeline.py --hw --diagnose [--gain N]
+
+    Interpretation guide
+    --------------------
+    FM μ ≈ 0 kHz          : no carrier offset  ✓
+    FM μ >> ±83 kHz      : Pluto LO frequency error (slicing errors!)
+    FM σ ≈ 100–280 kHz   : 4-FSK modulation detected  ✓
+    FM σ < 30 kHz        : CW carrier or noise — no 4-FSK present!
+    Symbol peaks at ±1,±3: demodulation OK; if frames=0 → CRC/timing bug
+    No symbol peaks       : GardnerTED not locking
+    """
+    try:
+        import adi
+    except ImportError:
+        print("[ERROR] pyadi-iio not installed")
+        return
+
+    _SEP = "\u2550" * 62
+    print(f"\n{_SEP}")
+    print(f"  DIAGNOSE  {CENTER_FREQ/1e6:.3f} MHz  SR={SAMPLE_RATE/1e6:.2f} MSPS  "
+          f"gain={rx_gain_db} dB  n={n_blocks} blocks")
+    print(_SEP)
+
+    sdr = adi.Pluto(rx_uri)
+    try:
+        sdr.tx_destroy_buffer()
+    except Exception:
+        pass
+    sdr.tx_hardwaregain_chan0   = -89
+    sdr.rx_lo                  = int(CENTER_FREQ)
+    sdr.sample_rate            = int(SAMPLE_RATE)
+    sdr.rx_rf_bandwidth        = int(SAMPLE_RATE)
+    sdr.rx_buffer_size         = BUF_SAMPLES
+    sdr.gain_control_mode_chan0 = "manual"
+    sdr.rx_hardwaregain_chan0   = rx_gain_db
+
+    lpf = PreFilter()
+    fmd = FMDemod()
+    mf  = MatchedFilter(RRC_KERNEL)
+    agc = AGC()
+    ted = GardnerTED(SPS, initial_offset=TOTAL_CHAIN_DELAY)
+
+    iq_rms_list, freq_list, sym_list = [], [], []
+
+    dur_ms = n_blocks * BUF_SAMPLES / SAMPLE_RATE * 1000
+    print(f"Capturing {n_blocks} blocks ≈ {dur_ms:.0f} ms ...", end="", flush=True)
+    for _ in range(n_blocks):
+        raw = sdr.rx()
+        iq  = np.asarray(raw, dtype=np.complex64) / 2048.0
+        iq_rms_list.append(float(np.sqrt(np.mean(np.abs(iq)**2))))
+        iq_filt   = lpf.run(iq)
+        freq_norm = fmd.demod(iq_filt)
+        mf_out    = mf.run(freq_norm)
+        mf_agc    = agc.process(mf_out)
+        ted_res   = ted.process(mf_agc)
+        freq_list.extend(freq_norm.tolist())
+        for sv, _ in ted_res:
+            sym_list.append(sv)
+    try:
+        sdr.rx_destroy_buffer()
+    except Exception:
+        pass
+    print(" done")
+
+    rms_a  = np.asarray(iq_rms_list)
+    freq_a = np.asarray(freq_list, dtype=np.float32)
+    sym_a  = np.asarray(sym_list,  dtype=np.float32)
+
+    def _hist(arr, lo=-5.0, hi=5.0, n=20):
+        cnt, edges = np.histogram(arr, bins=n, range=(lo, hi))
+        pk = cnt.max() or 1
+        lines = []
+        for i, c in enumerate(cnt):
+            center = (edges[i] + edges[i+1]) / 2
+            bar = '\u2588' * (c * 38 // pk) if c > 0 else ''
+            lines.append(f"  {center:+5.1f} \u2502 {bar} ({c})")
+        return "\n".join(lines)
+
+    # ── IQ RMS ───────────────────────────────────────────────────────────
+    print(f"\n\u2500\u2500 IQ RMS (应在 0.05–0.40) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
+    print(f"  mean={rms_a.mean():.4f}  std={rms_a.std():.5f}  "
+          f"min={rms_a.min():.4f}  max={rms_a.max():.4f}")
+
+    # ── FM Demod ─────────────────────────────────────────────────────────
+    off_hz     = float(freq_a.mean()) * (FSK_DEVIATION / 3.0)
+    std_norm   = float(freq_a.std())
+    print(f"\n\u2500\u2500 FM Demod 输出 (归一化，4-FSK 理想峰在 \u00b11, \u00b13) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
+    print(f"  \u03bc={freq_a.mean():+.4f} (≈ {off_hz/1e3:+.1f} kHz 载波偏移)  \u03c3={std_norm:.4f}")
+    print(_hist(freq_a))
+
+    # ── Symbols ──────────────────────────────────────────────────────────
+    print(f"\n\u2500\u2500 MF + AGC + TED 输出符号采样 ({len(sym_a)} 个) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
+    if len(sym_a) > 0:
+        print(f"  \u03bc={sym_a.mean():+.4f}  \u03c3={sym_a.std():.4f}")
+        print(_hist(sym_a))
+    else:
+        print("  [!] 0 个符号 — TOTAL_CHAIN_DELAY 设置过大？来不及进行采样")
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    print(f"\n\u2500\u2500 诊断总结 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
+    if rms_a.mean() < 0.02:
+        print("  \u26a0 无信号：IQ_RMS 过小 — 检查发射机功率/天线")
+    elif rms_a.mean() > 0.50:
+        print("  \u26a0 ADC 饶和：降低 rx_gain_db")
+    else:
+        print(f"  \u2713 IQ 电平正常 ({rms_a.mean():.3f})")
+
+    if abs(freq_a.mean()) > 0.5:
+        print(f"  \u26a0 载波偏移: {off_hz/1e3:+.1f} kHz \u2014 当 |offset| > 83 kHz 时切片错误")
+        print(f"     建议: 检查 Pluto LO 校准或启用 AFC")
+    else:
+        print(f"  \u2713 载波偏移 OK ({off_hz/1e3:+.1f} kHz)")
+
+    if std_norm < 0.3:
+        print(f"  \u26a0 FM \u65b9差很小 (\u03c3={std_norm:.3f}) — 当前信号可能是 CW/噪声，不是 4-FSK!")
+        print(f"     建议: 确认对方发射机正在运行并对准到此频率")
+    elif std_norm < 2.5:
+        print(f"  \u2713 FM 方差符合 4-FSK 预期 (\u03c3={std_norm:.3f})")
+    else:
+        print(f"  \u26a0 FM 方差过大 (\u03c3={std_norm:.3f}) — ADC 饶和或宽带噪声")
+
+    if len(sym_a) == 0:
+        print("  \u26a0 TED 返回 0 个符号 — 检查 TOTAL_CHAIN_DELAY")
+    print()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -707,6 +850,8 @@ if __name__ == '__main__':
       python rx_pluto_pipeline.py --hw --tx-only
       python rx_pluto_pipeline.py --hw --key RM2026
       python rx_pluto_pipeline.py --hw --gain 40
+      python rx_pluto_pipeline.py --hw --diagnose      # DSP chain diagnostic histogram
+      python rx_pluto_pipeline.py --hw --diagnose --gain 45
     """
     hw      = '--hw'      in sys.argv
     rx_only = '--rx-only' in sys.argv
@@ -723,6 +868,10 @@ if __name__ == '__main__':
         idx = sys.argv.index('--gain')
         if idx + 1 < len(sys.argv):
             gain = int(sys.argv[idx + 1])
+
+    if hw and '--diagnose' in sys.argv:
+        run_pluto_diagnose(rx_gain_db=gain)
+        sys.exit(0)
 
     if not hw:
         software_loopback_test(key=key)
