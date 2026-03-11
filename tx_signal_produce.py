@@ -101,7 +101,10 @@ class PlutoTxProducer:
         sps  = sr // _BAUD_RATE
 
         info_iq = self._build_iq(self._key, sr=sr, sps=sps)
-        info_iq = self._apply_frequency_offset(info_iq, plan.broadcast_offset_hz, sr)
+        # TX LO is already set to our_broadcast_freq_hz (own team's channel).
+        # No additional frequency offset is needed — the signal sits at DC
+        # relative to the TX LO.  broadcast_offset_hz is an RX-side concept
+        # (offset of the OPPONENT's signal inside the SDR capture band).
 
         if self._simulate_arena:
             tx_iq = self._mix_arena_signals(info_iq, sr=sr)
@@ -111,6 +114,7 @@ class PlutoTxProducer:
         self._sdr = self._open_pluto(sr=sr)
         self._sdr.tx_cyclic_buffer = True
         self._sdr.tx(tx_iq)
+        print(f"[PLUTO-TX] Cyclic TX running  ({len(tx_iq)} samples)")
 
     def stop(self) -> None:
         """Halt TX and release the Pluto handle."""
@@ -125,6 +129,7 @@ class PlutoTxProducer:
 
     def _open_pluto(self, sr: int):
         plan = self._cfg.plan
+        print(f"[PLUTO-TX] Connecting to {self._cfg.pluto_uri} ...")
         sdr  = adi.Pluto(uri=self._cfg.pluto_uri)
         # TX LO must be OWN team's broadcast frequency, not the opponent's.
         # plan.center_freq_hz = opponent's frequency (used as RX SDR centre).
@@ -133,6 +138,8 @@ class PlutoTxProducer:
         sdr.sample_rate             = sr
         sdr.tx_rf_bandwidth         = sr
         sdr.tx_hardwaregain_chan0   = -self._cfg.tx_attenuation_db
+        print(f"[PLUTO-TX] {plan.our_broadcast_freq_hz/1e6:.3f} MHz  "
+              f"SR={sr/1e6:.2f} MSPS  atten={self._cfg.tx_attenuation_db} dB")
         return sdr
 
     def _build_iq(self, key: str, sr: int, sps: int) -> np.ndarray:
@@ -153,11 +160,13 @@ class PlutoTxProducer:
         frame_bytes = build_protocol_frame(key)
         bits        = _bytes_to_bits(bytes(frame_bytes))
         symbols     = _bits_to_symbols(bits)                 # {-3,-1,+1,+3}
+        symbols_rep = np.tile(symbols, 4)   # 4× repeat for glitch-free cyclic DMA loop
+                                            # (matches rx_pluto_pipeline.py PlutoTX)
 
         # RRC pulse shaping (same filter as RX matched filter)
         rrc     = _make_rrc(_RRC_ALPHA, _RRC_SPAN, sps)
-        upsampl = np.zeros(len(symbols) * sps)
-        upsampl[::sps] = symbols
+        upsampl = np.zeros(len(symbols_rep) * sps)
+        upsampl[::sps] = symbols_rep
         freq_pulse = np.convolve(upsampl, rrc, mode="full")[len(rrc) // 2:]
         freq_pulse = freq_pulse[:len(upsampl)]
 
@@ -230,8 +239,7 @@ def _bits_to_symbols(bits: list[int]) -> np.ndarray:
 def _make_rrc(alpha: float, span: int, sps: int) -> np.ndarray:
     """Root Raised Cosine FIR  —  span*sps taps (even length)."""
     n_taps = span * sps
-    t      = np.arange(n_taps) - n_taps // 2
-    t      = t / sps
+    t      = (np.arange(n_taps) - (n_taps - 1) / 2) / sps   # exact fractional centre
     h      = np.zeros(n_taps)
     for i, ti in enumerate(t):
         if ti == 0:

@@ -108,7 +108,7 @@ def main() -> None:
         from tx_signal_produce import PlutoTxProducer
         tx = PlutoTxProducer(mgr, key=args.key, simulate_arena=False)
         tx.start()
-        print(f"[TX] Broadcasting key='{args.key}' on {plan.center_freq_hz / 1e6:.3f} MHz")
+        print(f"[TX] Broadcasting key='{args.key}' on {plan.our_broadcast_freq_hz / 1e6:.3f} MHz")
 
     # ── RX + DSP ───────────────────────────────────────────────────────────
     rx  = None
