@@ -49,7 +49,7 @@ from typing import Optional
 
 # ─── CRC implementations (must match TX side) ──────────────────────────────────
 
-def _crc8_rm(data: bytes) -> int:
+def crc8_rm(data: bytes) -> int:
     """CRC-8 (poly=0x31, init=0xFF, MSB-first) — matches RoboMaster referee spec."""
     crc = 0xFF
     for byte in data:
@@ -59,7 +59,7 @@ def _crc8_rm(data: bytes) -> int:
     return crc
 
 
-def _crc16_rm(data: bytes) -> int:
+def crc16_rm(data: bytes) -> int:
     """CRC-16/CCITT-FALSE  (poly=0x1021, init=0xFFFF, refin=False, refout=False)."""
     crc = 0xFFFF
     for byte in data:
@@ -68,6 +68,10 @@ def _crc16_rm(data: bytes) -> int:
             crc = ((crc << 1) ^ 0x1021) if (crc & 0x8000) else (crc << 1)
         crc &= 0xFFFF
     return crc
+
+# Backward-compatible aliases
+_crc8_rm = crc8_rm
+_crc16_rm = crc16_rm
 
 
 # ─── Protocol constants ─────────────────────────────────────────────────────────
@@ -86,7 +90,7 @@ CMDS_LEN: dict[int, int] = {
 }
 
 # Robot slot indices used across 0x0A01 – 0x0A05
-_SLOTS = ("hero", "engineer", "infantry_3", "infantry_4", "infantry_5", "sentry")
+_SLOTS = ("hero", "engineer", "infantry_3", "infantry_4", "aerial", "sentry")
 
 # ─── Individual parsers ─────────────────────────────────────────────────────────
 
@@ -94,25 +98,20 @@ def parse_0x0A01(payload: bytes) -> dict:
     """
     Enemy Positions (24 bytes)
     ──────────────────────────
-    5 ground units × (uint16 x_cm, uint16 y_cm) = 20 bytes
-    uint16  valid_mask   — bit N=1 means slot N coordinates are fresh
-    uint16  _reserved
+    6 robots × (uint16 x_cm, uint16 y_cm) = 24 bytes
 
     Units: centimetres.  Convert to metres by dividing by 100.
-    Slots  0..4 → hero, engineer, infantry_3, infantry_4, infantry_5
-    (Sentry does not broadcast ground coordinates.)
+    Slots: hero, engineer, infantry_3, infantry_4, aerial, sentry
     """
     if len(payload) < 24:
         raise ValueError(f"0x0A01 payload too short: {len(payload)} < 24")
     positions = {}
-    for i, name in enumerate(_SLOTS[:5]):
+    for i, name in enumerate(_SLOTS):
         x_cm, y_cm = struct.unpack_from("<HH", payload, i * 4)
         positions[name] = (round(x_cm / 100, 2), round(y_cm / 100, 2))
-    valid_mask, = struct.unpack_from("<H", payload, 20)
     return {
-        "cmd":        "0x0A01",
-        "positions":  positions,           # {slot: (x_m, y_m)}
-        "valid_mask": f"0x{valid_mask:04X}",
+        "cmd":       "0x0A01",
+        "positions": positions,           # {slot: (x_m, y_m)}
     }
 
 
