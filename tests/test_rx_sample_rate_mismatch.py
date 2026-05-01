@@ -252,3 +252,55 @@ def test_L3_jammer_config_smoke():
 
     finally:
         os.unlink(tmp_path)
+
+
+# ── Direct-tune smoke test ─────────────────────────────────────────────────
+
+def test_direct_tune_overrides_input_rate():
+    """
+    target_jammer_level=3 + rx_freq=434.32:
+    GFSK2Demodulator gets input_sample_rate=1MSPS, not 3MSPS.
+    """
+    import json, tempfile, os
+    from config_manager import ConfigManager
+
+    cfg = {
+        "team_color": "red",
+        "target_jammer_level": 3,
+        "phy_mode": "2gfsk",
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(cfg, f)
+        tmp = f.name
+
+    try:
+        mgr = ConfigManager(tmp).load()
+        plan = mgr.plan
+        phy = mgr.phy_config
+
+        assert plan.sample_rate_hz >= 3_000_000  # wideband
+
+        # Simulate --rx-freq=434.32: Pluto runs at 1 MSPS
+        rx_sr_override = phy.sample_rate  # 1_000_000
+
+        # Simulate DSPProcessor with input_sample_rate_hz override
+        rx_dev = phy.jammer_deviation_hz
+        demod = GFSK2Demodulator(
+            sps=phy.sps,
+            bt=phy.bt,
+            span=phy.span,
+            deviation_hz=rx_dev,
+            sample_rate=phy.sample_rate,
+            input_sample_rate=rx_sr_override,  # 1 MSPS, NOT 3 MSPS
+            channelizer_offset_hz=None,         # direct-tune: no channelizer
+            threshold_mode="zero",
+        )
+
+        assert not demod._needs_decim
+        assert demod._decim == 1
+        assert demod._demod_sr == 1_000_000
+        assert demod._input_sr == 1_000_000
+        assert demod._chan_offset is None
+
+    finally:
+        os.unlink(tmp)

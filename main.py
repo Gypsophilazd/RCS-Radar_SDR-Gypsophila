@@ -271,9 +271,11 @@ def main() -> None:
         # --rx-freq: direct-tune at 1 MSPS, bypass channelizer
         rx_freq_override = None
         rx_sr_override = None
+        dsp_input_sr_override = None
         if args.rx_freq is not None:
             rx_freq_override = int(args.rx_freq * 1e6)
-            rx_sr_override = 1_000_000.0
+            rx_sr_override = phy.sample_rate
+            dsp_input_sr_override = phy.sample_rate  # Pluto runs at 1 MSPS
 
         def on_frame(frame: dict) -> None:
             _on_frame(frame, dashboard)
@@ -289,6 +291,7 @@ def main() -> None:
             out_sym_q = (dashboard._q_sym if dashboard else None),
             rx_source = rx_src,
             direct_tune=(args.rx_freq is not None),
+            input_sample_rate_hz=dsp_input_sr_override,
         )
         t_dsp = threading.Thread(target=dsp.run_forever, daemon=True, name="DSP")
         t_dsp.start()

@@ -61,6 +61,10 @@ class DSPProcessor:
         If True, the SDR is directly tuned to the channel of interest
         at 1 MSPS — no channelizer/decimation needed regardless of
         plan.channelize.
+    input_sample_rate_hz : float or None
+        Override the SDR input sample rate.  When None, defaults to
+        plan.sample_rate_hz.  Set to phy.sample_rate when direct_tune
+        is active (Pluto runs at 1 MSPS, no decimation needed).
     """
 
     def __init__(
@@ -72,6 +76,7 @@ class DSPProcessor:
         out_sym_q: Optional["queue.Queue[np.ndarray]"] = None,
         rx_source: str = "broadcast",
         direct_tune: bool = False,
+        input_sample_rate_hz: float | None = None,
     ):
         self._cfg      = config
         self._q_in     = in_queue
@@ -106,13 +111,19 @@ class DSPProcessor:
                 ac_mode = phy.access_code_mode
 
             # 2-GFSK chain: demod → deframer → reassembler → decode
+            # input_sample_rate_hz override wins over plan.sample_rate_hz
+            # (used when --rx-freq direct-tunes Pluto to 1 MSPS)
+            input_sr = (input_sample_rate_hz
+                        if input_sample_rate_hz is not None
+                        else float(plan.sample_rate_hz))
+
             self._demod = GFSK2Demodulator(
                 sps=phy.sps,
                 bt=phy.bt,
                 span=phy.span,
                 deviation_hz=rx_dev,
                 sample_rate=phy.sample_rate,
-                input_sample_rate=float(plan.sample_rate_hz),
+                input_sample_rate=input_sr,
                 channelizer_offset_hz=chan_offset,
                 threshold_mode="zero",
                 sub_block_syms=phy.sub_block_syms,
@@ -122,10 +133,10 @@ class DSPProcessor:
             self._legacy_modem = None
 
             # ── Debug: print RX DSP configuration ───────────────────────────
-            decim_factor = (float(plan.sample_rate_hz) / phy.sample_rate
-                            if plan.sample_rate_hz != phy.sample_rate else 1)
+            decim_factor = (input_sr / phy.sample_rate
+                            if input_sr != phy.sample_rate else 1)
             print(f"[DSP] RX source      : {rx_source}")
-            print(f"[DSP] SDR sample rate: {plan.sample_rate_hz / 1e6:.2f} MSPS")
+            print(f"[DSP] SDR sample rate: {input_sr / 1e6:.2f} MSPS")
             print(f"[DSP] Demod rate     : {phy.sample_rate / 1e6:.2f} MSPS")
             print(f"[DSP] Deviation      : {rx_dev / 1e3:.1f} kHz")
             print(f"[DSP] Channelizer    : {chan_offset / 1e3:+.1f} kHz" if chan_offset
