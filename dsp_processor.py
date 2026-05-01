@@ -62,9 +62,15 @@ class DSPProcessor:
         at 1 MSPS — no channelizer/decimation needed regardless of
         plan.channelize.
     input_sample_rate_hz : float or None
-        Override the SDR input sample rate.  When None, defaults to
-        plan.sample_rate_hz.  Set to phy.sample_rate when direct_tune
-        is active (Pluto runs at 1 MSPS, no decimation needed).
+        Override the SDR input sample rate.
+    threshold_mode : str
+        "zero" or "running_median".
+    use_lpf : bool
+        Enable pre-FM LPF.
+    use_mf : bool
+        Enable Gaussian matched filter.
+    decim_cutoff_hz : float or None
+        Custom decimation LPF cutoff (None = auto from deviation).
     """
 
     def __init__(
@@ -77,6 +83,10 @@ class DSPProcessor:
         rx_source: str = "broadcast",
         direct_tune: bool = False,
         input_sample_rate_hz: float | None = None,
+        threshold_mode: str = "zero",
+        use_lpf: bool = False,
+        use_mf: bool = False,
+        decim_cutoff_hz: float | None = None,
     ):
         self._cfg      = config
         self._q_in     = in_queue
@@ -125,8 +135,11 @@ class DSPProcessor:
                 sample_rate=phy.sample_rate,
                 input_sample_rate=input_sr,
                 channelizer_offset_hz=chan_offset,
-                threshold_mode="zero",
+                threshold_mode=threshold_mode,
+                use_lpf=use_lpf,
+                use_matched_filter=use_mf,
                 sub_block_syms=phy.sub_block_syms,
+                decim_cutoff_hz=decim_cutoff_hz,
             )
             self._deframer = AirPacketDeframer(mode=ac_mode)
             self._reassembler = PayloadStreamReassembler()
@@ -140,10 +153,15 @@ class DSPProcessor:
             print(f"[DSP] Demod rate     : {phy.sample_rate / 1e6:.2f} MSPS")
             print(f"[DSP] Deviation      : {rx_dev / 1e3:.1f} kHz")
             print(f"[DSP] Channelizer    : {chan_offset / 1e3:+.1f} kHz" if chan_offset
-                  else "[DSP] Channelizer    : disabled (direct-tune or no channelize)")
+                  else "[DSP] Channelizer    : disabled")
             print(f"[DSP] Decimation     : {decim_factor:.0f}:1" if decim_factor > 1
                   else "[DSP] Decimation     : none (1:1)")
+            if decim_factor > 1:
+                print(f"[DSP] Decim cutoff   : {self._demod.decim_cutoff_hz / 1e3:.0f} kHz")
             print(f"[DSP] AC mode        : {ac_mode}")
+            print(f"[DSP] Threshold      : {threshold_mode}")
+            print(f"[DSP] LPF            : {'on' if use_lpf else 'off'}  "
+                  f"MF: {'on' if use_mf else 'off'}")
 
             # ── Frame-sync state machine (unused in 2-GFSK mode) ────────────
             self._bit_sreg    : int       = 0
@@ -222,12 +240,6 @@ class DSPProcessor:
         else:
             self._process_block_legacy(iq)
 
-        # Print profiler summary every ~8 blocks (~2 s at 1 MSPS 262144-sample blocks)
-        self._profiler_summary_blocks += 1
-        if self._profiler_summary_blocks % 8 == 0:
-            print(self._profiler.summary())
-            self._profiler.reset_counts()
-
     # ── 2-GFSK path ──────────────────────────────────────────────────────────
 
     def _process_block_2gfsk(self, iq: np.ndarray) -> None:
@@ -237,6 +249,11 @@ class DSPProcessor:
 
         # 2. Deframe: hunt access codes, extract 15-byte payloads
         payloads = self._deframer.push_bits(bits)
+
+        # ── Post-channelizer diagnostics (every ~8 blocks) ─────────────────
+        self._profiler_summary_blocks += 1
+        if self._profiler_summary_blocks % 8 == 0:
+            self._print_diag(iq, bits, payloads)
 
         # Track AC hits and payloads
         if payloads:
@@ -255,9 +272,31 @@ class DSPProcessor:
                     if result is not None:
                         self._profiler.record_decoded_frame()
                         self._on_frame(result)
-                else:
-                    # Frame bytes exist but CRC failed
-                    pass
+
+    def _print_diag(self, iq: np.ndarray, bits: list[int],
+                    payloads: list[bytes]) -> None:
+        """Print per-block diagnostic stats."""
+        import numpy as np
+        iq_rms = float(np.sqrt(np.mean(np.abs(iq) ** 2)))
+        # Quick FM stats on raw IQ
+        if len(iq) > 1:
+            fm_q = np.angle(iq[1:] * np.conj(iq[:-1]))
+            fm_hz = fm_q * (self._sr / (2.0 * np.pi))
+            fm_mean = float(np.mean(fm_hz)) / 1e3
+            fm_std = float(np.std(fm_hz)) / 1e3
+        else:
+            fm_mean = fm_std = 0.0
+        n_bits = len(bits)
+        n_ac = len(payloads)
+        print(f"[DIAG] blk={self._profiler_summary_blocks}  "
+              f"IQ_RMS={iq_rms:.4f}  "
+              f"FM μ={fm_mean:+.1f}kHz σ={fm_std:.0f}kHz  "
+              f"bits={n_bits}  AC/payloads={n_ac}  "
+              f"frames={self._profiler.decoded_frames_per_sec:.1f}/s", flush=True)
+
+        # Print profiler summary on the same cadence
+        print(self._profiler.summary())
+        self._profiler.reset_counts()
 
     # ── Legacy 4-RRC-FSK path ────────────────────────────────────────────────
 

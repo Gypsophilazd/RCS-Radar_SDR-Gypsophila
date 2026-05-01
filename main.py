@@ -56,6 +56,14 @@ def _parse_args() -> argparse.Namespace:
                    help="RX listen target (default: from config.json rx_source)")
     p.add_argument("--rx-freq", type=float, default=None, metavar="MHz",
                    help="RX direct-tune frequency override at 1 MSPS (bypasses channelizer)")
+    p.add_argument("--threshold-mode", default="zero", choices=["zero", "running_median"],
+                   help="Symbol slicer threshold mode (default: zero)")
+    p.add_argument("--use-lpf", action="store_true",
+                   help="Enable pre-FM LPF")
+    p.add_argument("--use-mf", action="store_true",
+                   help="Enable Gaussian matched filter")
+    p.add_argument("--decim-cutoff-hz", type=float, default=None, metavar="HZ",
+                   help="Override decimation LPF cutoff in Hz (default: auto from deviation)")
     p.add_argument("--no-gui",   action="store_true")
     p.add_argument("--demo",     action="store_true")
     p.add_argument("--test-tx-enable", action="store_true",
@@ -292,6 +300,10 @@ def main() -> None:
             rx_source = rx_src,
             direct_tune=(args.rx_freq is not None),
             input_sample_rate_hz=dsp_input_sr_override,
+            threshold_mode=args.threshold_mode,
+            use_lpf=args.use_lpf,
+            use_mf=args.use_mf,
+            decim_cutoff_hz=args.decim_cutoff_hz,
         )
         t_dsp = threading.Thread(target=dsp.run_forever, daemon=True, name="DSP")
         t_dsp.start()

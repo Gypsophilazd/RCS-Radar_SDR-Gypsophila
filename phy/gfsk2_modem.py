@@ -143,6 +143,10 @@ class GFSK2Demodulator:
         (default False — only needed for noisy channels).
     sub_block_syms : int
         Symbols between clock phase re-search (default 512).
+    decim_cutoff_hz : float or None
+        Decimation LPF cutoff in Hz.  When None, auto-computed as
+        min(deviation_hz * 1.5, demod_sr * 0.45).  Raise for wide-deviation
+        channels (L1/L2) if needed; lower for narrow channels (L3).
     """
 
     def __init__(
@@ -160,12 +164,13 @@ class GFSK2Demodulator:
         lpf_taps: int = 63,
         use_matched_filter: bool = False,
         sub_block_syms: int = 512,
+        decim_cutoff_hz: float | None = None,
     ):
         self._sps = int(sps)
         self._bt = bt
         self._span = span
         self._deviation = float(deviation_hz)
-        self._demod_sr = float(sample_rate)        # rate after decimation
+        self._demod_sr = float(sample_rate)
         self._input_sr = float(input_sample_rate if input_sample_rate is not None
                                else sample_rate)
         self._chan_offset = channelizer_offset_hz
@@ -183,19 +188,29 @@ class GFSK2Demodulator:
             )
         self._needs_decim = self._decim > 1
 
-        # Anti-aliasing LPF for decimation: cutoff at 40% of demod Nyquist
-        # to allow for FIR transition band.  For GFSK with deviation ≤ 450 kHz
-        # this still passes the full modulated bandwidth.
         if self._needs_decim:
+            # Auto cutoff: wide enough for deviation, but must leave
+            # room for the FIR transition band before the decimated
+            # Nyquist.  At 3:1 decimation this is ~440 kHz for 1 MSPS
+            # demod.  Higher cutoffs risk aliasing from the transition.
+            if decim_cutoff_hz is not None:
+                self._decim_cutoff = float(decim_cutoff_hz)
+            else:
+                # deviation_hz * 1.6 covers the GFSK occupied BW;
+                # cap at 44% demod Nyquist to stay clear of aliasing
+                self._decim_cutoff = min(deviation_hz * 1.6,
+                                         self._demod_sr * 0.44)
+            # Scale taps with decimation factor for sharper transition
+            decim_taps = max(lpf_taps, lpf_taps * self._decim) | 1
             nyq_input = self._input_sr / 2.0
-            cutoff_decim = self._demod_sr * 0.40
             self._decim_lpf = firwin(
-                lpf_taps, cutoff_decim / nyq_input, window="hamming"
+                decim_taps, self._decim_cutoff / nyq_input, window="hamming"
             ).astype(np.float32)
-            self._decim_zi = np.zeros(lpf_taps - 1, dtype=np.complex64)
+            self._decim_zi = np.zeros(decim_taps - 1, dtype=np.complex64)
         else:
             self._decim_lpf = None
             self._decim_zi = None
+            self._decim_cutoff = 0.0
 
         # ── LPF (optional, at demod rate) ─────────────────────────────────────
         if use_lpf:
@@ -232,6 +247,11 @@ class GFSK2Demodulator:
         self._median_buf: list[float] = []
 
     # ── public ────────────────────────────────────────────────────────────────
+
+    @property
+    def decim_cutoff_hz(self) -> float:
+        """Current decimation LPF cutoff in Hz (0 if no decimation)."""
+        return getattr(self, "_decim_cutoff", 0.0)
 
     def push_iq(self, iq: np.ndarray) -> list[int]:
         """
