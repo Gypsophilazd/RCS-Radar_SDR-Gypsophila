@@ -121,6 +121,19 @@ class DSPProcessor:
             self._reassembler = PayloadStreamReassembler()
             self._legacy_modem = None
 
+            # ── Debug: print RX DSP configuration ───────────────────────────
+            decim_factor = (float(plan.sample_rate_hz) / phy.sample_rate
+                            if plan.sample_rate_hz != phy.sample_rate else 1)
+            print(f"[DSP] RX source      : {rx_source}")
+            print(f"[DSP] SDR sample rate: {plan.sample_rate_hz / 1e6:.2f} MSPS")
+            print(f"[DSP] Demod rate     : {phy.sample_rate / 1e6:.2f} MSPS")
+            print(f"[DSP] Deviation      : {rx_dev / 1e3:.1f} kHz")
+            print(f"[DSP] Channelizer    : {chan_offset / 1e3:+.1f} kHz" if chan_offset
+                  else "[DSP] Channelizer    : disabled (direct-tune or no channelize)")
+            print(f"[DSP] Decimation     : {decim_factor:.0f}:1" if decim_factor > 1
+                  else "[DSP] Decimation     : none (1:1)")
+            print(f"[DSP] AC mode        : {ac_mode}")
+
             # ── Frame-sync state machine (unused in 2-GFSK mode) ────────────
             self._bit_sreg    : int       = 0
             self._frame_state : str       = "HUNT"

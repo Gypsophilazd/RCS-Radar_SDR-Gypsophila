@@ -50,11 +50,20 @@ def _build_rm_frame(cmd_id, payload, seq=1):
 
 def test_level_0_sample_rate():
     """target_jammer_level=0 → plan.sample_rate_hz == 1_000_000."""
-    mgr = load_config()
-    plan = mgr.plan
-    assert plan.jammer_level == 0
-    assert plan.sample_rate_hz == 1_000_000
-    assert not plan.channelize
+    import json, tempfile, os
+    from config_manager import ConfigManager
+    cfg = {"team_color": "red", "target_jammer_level": 0, "phy_mode": "2gfsk"}
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(cfg, f)
+        tmp = f.name
+    try:
+        mgr = ConfigManager(tmp).load()
+        plan = mgr.plan
+        assert plan.jammer_level == 0
+        assert plan.sample_rate_hz == 1_000_000
+        assert not plan.channelize
+    finally:
+        os.unlink(tmp)
 
 
 # ── Test: equal rates → no decimation ──────────────────────────────────────
@@ -159,18 +168,87 @@ def test_inverted_rates_raises():
 
 def test_channelizer_with_decimation():
     """Channelizer at input rate + decimation = correct frequency shift."""
-    # The key invariant: when channelizer_offset_hz is given AND rates differ,
-    # the channelizer shifts at the INPUT rate, then decimation reduces to
-    # the DEMOD rate where FM discriminator operates.
     demod = GFSK2Demodulator(
         sps=_SPS, bt=_BT, span=_SPAN,
         deviation_hz=_DEV,
         sample_rate=1_000_000,
         input_sample_rate=3_000_000,
-        channelizer_offset_hz=500_000.0,  # shift by 500 kHz
+        channelizer_offset_hz=500_000.0,
     )
     assert demod._needs_decim
     assert demod._chan_offset == 500_000.0
-    # Channelizer operates at input_sr (3e6), FM discrim at demod_sr (1e6)
     assert demod._input_sr == 3_000_000
     assert demod._demod_sr == 1_000_000
+
+
+# ── Config smoke test: L3 jammer ────────────────────────────────────────────
+
+def test_L3_jammer_config_smoke():
+    """
+    Verify that with target_jammer_level=3 and rx_source=jammer:
+    - plan.sample_rate_hz > phy.sample_rate
+    - GFSK2Demodulator would receive input_sample_rate=plan.sample_rate_hz
+    - decimation is active
+    - channelizer offset is non-zero (L3 is a distinct channel)
+    """
+    # Simulate what DSPProcessor does with a L3 jammer config
+    import json, tempfile, os
+    from config_manager import ConfigManager
+
+    # Write a temp config with level=3
+    cfg = {
+        "team_color": "red",
+        "target_jammer_level": 3,
+        "phy_mode": "2gfsk",
+        "rx_source": "jammer",
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(cfg, f)
+        tmp_path = f.name
+
+    try:
+        mgr = ConfigManager(tmp_path).load()
+        plan = mgr.plan
+        phy = mgr.phy_config
+
+        # Level 3 → channelize must be True
+        assert plan.jammer_level == 3
+        assert plan.channelize
+
+        # SDR sample rate must be >= 3 MSPS
+        assert plan.sample_rate_hz >= 3_000_000
+
+        # Demod rate stays at 1 MSPS
+        assert phy.sample_rate == 1_000_000
+
+        # Jammer deviation is L3-specific (~105.8 kHz)
+        assert 100_000 < phy.jammer_deviation_hz < 111_000
+
+        # Channelizer offset is non-zero (L3 ≠ broadcast)
+        assert plan.jammer_offset_hz != 0.0
+
+        # Build GFSK2Demodulator as DSPProcessor would
+        rx_dev = phy.jammer_deviation_hz
+        chan_offset = plan.jammer_offset_hz  # channelize=True
+        demod = GFSK2Demodulator(
+            sps=phy.sps,
+            bt=phy.bt,
+            span=phy.span,
+            deviation_hz=rx_dev,
+            sample_rate=phy.sample_rate,
+            input_sample_rate=float(plan.sample_rate_hz),
+            channelizer_offset_hz=chan_offset,
+            threshold_mode="zero",
+            sub_block_syms=phy.sub_block_syms,
+        )
+
+        # Verify decimation is active
+        assert demod._needs_decim
+        decim = round(plan.sample_rate_hz / phy.sample_rate)
+        assert demod._decim == decim
+        assert demod._demod_sr == 1_000_000
+        assert demod._chan_offset == chan_offset
+        assert abs(demod._deviation - rx_dev) < 1.0
+
+    finally:
+        os.unlink(tmp_path)
