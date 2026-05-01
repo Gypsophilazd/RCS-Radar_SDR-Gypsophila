@@ -13,7 +13,7 @@ from unittest.mock import patch, MagicMock
 
 def test_tx_producer_raises_without_enable():
     """PlutoTxProducer.start() raises RuntimeError when test_tx_enabled=False."""
-    from tx_signal_produce import PlutoTxProducer
+    from legacy_tx_signal_produce import PlutoTxProducer
     from config_manager import load_config
 
     mgr = load_config()
@@ -29,7 +29,7 @@ def test_tx_producer_allows_when_enabled():
     The actual Pluto open will fail (no hardware), but the guard
     itself must NOT raise.
     """
-    from tx_signal_produce import PlutoTxProducer
+    from legacy_tx_signal_produce import PlutoTxProducer
     from config_manager import load_config
 
     mgr = load_config()

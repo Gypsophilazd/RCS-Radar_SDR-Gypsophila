@@ -106,7 +106,7 @@ class DSPProcessor:
 
         elif phy.mode == "4rrcfsk_legacy":
             self._legacy_modem = Legacy4RRCFSKModem(
-                sample_rate=sr,
+                sample_rate=self._sr,
                 baud_rate=250_000,
                 channelize=plan.channelize,
                 broadcast_offset_hz=plan.broadcast_offset_hz,
@@ -123,7 +123,7 @@ class DSPProcessor:
             self._header_bits : int       = 0
             self._body_bits   : int       = 0
         else:
-            raise ValueError(f"Unknown phy_mode: {phy_mode!r}")
+            raise ValueError(f"Unknown phy_mode: {phy.mode!r}")
 
         self._stop_event = threading.Event()
 

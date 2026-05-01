@@ -1,9 +1,15 @@
 {
-  "_comment": "RCS-Radar-SDR Arena Configuration — RM2026 Rulebook V1.3.0",
-  "team_color": "blue",
+  "_comment": "RCS-Radar-SDR — RM2026 2-GFSK Arena Configuration",
+
+  "_WARNING_dual_pluto": "If you have TWO Pluto SDRs connected simultaneously, pluto_uri and pluto_rx_uri MUST be different. Use setup_devices.py to find each board's URI. Leaving both as ip:pluto.local works only with a SINGLE Pluto.",
+
+  "team_color": "red",
   "target_jammer_level": 0,
+  "phy_mode": "2gfsk",
+
   "pluto_uri": "ip:pluto.local",
   "pluto_rx_uri": "ip:pluto.local",
+
   "rx_gain_db": 45,
   "tx_attenuation_db": 0,
   "rx_buf_size": 262144

@@ -3,21 +3,25 @@ main.py
 =======
 Entry Point — RCS-Radar-SDR  RM2026 Arena System
 
-Wires all five modules together and launches the assessment dashboard.
+Wires all modules together and launches the assessment dashboard.
 
 Usage
 ─────
   python main.py [--config path/to/config.json] [--tx-only] [--rx-only]
-                 [--key MYKEY] [--no-gui] [--demo]
+                 [--key MYKEY] [--air-mode info|jammer] [--freq MHz]
+                 [--no-gui] [--demo] [--test-tx-enable]
 
 Flags
 ─────
-  --config  PATH   path to config.json  (default: ./config.json)
-  --tx-only        only run Pluto TX; no RX / DSP
-  --rx-only        only run RX + DSP; skip TX  (external transmitter assumed)
-  --key     STR    override jammer key string  (default: from config or "RM2026")
-  --no-gui         headless mode; decoded frames printed to stdout only
-  --demo           use synthetic data (no hardware); GUI smoke-test
+  --config    PATH   path to config.json  (default: ./config.json)
+  --tx-only          only run Pluto TX; no RX / DSP
+  --rx-only          only run RX + DSP; skip TX
+  --key       STR    override jammer key string  (default: "RM2026")
+  --air-mode  STR    Air Packet Access Code: "info" or "jammer" (default: "info")
+  --freq      MHz    TX frequency override in MHz (default: auto from config)
+  --no-gui           headless mode; decoded frames printed to stdout only
+  --demo             use synthetic data (no hardware); GUI smoke-test
+  --test-tx-enable   REQUIRED to enable TX (safety interlock)
 """
 
 from __future__ import annotations
@@ -25,9 +29,15 @@ from __future__ import annotations
 import argparse
 import json
 import queue
+import struct
 import sys
 import threading
 import time
+from pathlib import Path
+
+import numpy as np
+
+from packet_decoder import crc8_rm, crc16_rm, SOF
 
 
 def _parse_args() -> argparse.Namespace:
@@ -36,10 +46,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--tx-only",  action="store_true")
     p.add_argument("--rx-only",  action="store_true")
     p.add_argument("--key",      default="RM2026",  metavar="KEY")
+    p.add_argument("--air-mode", default="info",   choices=["info", "jammer"],
+                   help="Air Packet Access Code type (default: info)")
+    p.add_argument("--freq",     type=float, default=None, metavar="MHz",
+                   help="TX frequency override in MHz")
     p.add_argument("--no-gui",   action="store_true")
     p.add_argument("--demo",     action="store_true")
     p.add_argument("--test-tx-enable", action="store_true",
-                   help="Enable TX (disabled by default — use only in legal test conditions)")
+                   help="Enable TX (disabled by default)")
     return p.parse_args()
 
 
@@ -51,6 +65,65 @@ def _on_frame(frame: dict, dashboard=None) -> None:
         dashboard.push_decoded(frame)
 
 
+def _build_rm_frame(key: str) -> bytes:
+    """Build a valid 0x0A06 RM frame with CRC8/CRC16."""
+    cmd_id = 0x0A06
+    key_bytes = key.encode("ascii")[:6].ljust(6, b"\x00")
+    payload = struct.pack("<H", cmd_id) + key_bytes
+    data_len = len(payload)
+    header = bytes([SOF, data_len & 0xFF, (data_len >> 8) & 0xFF, 1])
+    crc8_val = crc8_rm(header)
+    crc16_input = header + bytes([crc8_val]) + payload
+    crc16_val = crc16_rm(crc16_input)
+    return crc16_input + struct.pack("<H", crc16_val)
+
+
+class _Gfsk2Tx:
+    """Thin wrapper around the 2-GFSK TX builder + Pluto SDR."""
+
+    def __init__(self, uri: str, freq_hz: int, atten_db: float,
+                 sr: float, deviation_hz: float, bt: float, sps: int):
+        self._uri = uri
+        self._freq_hz = freq_hz
+        self._atten = atten_db
+        self._sr = sr
+        self._deviation = deviation_hz
+        self._bt = bt
+        self._sps = sps
+        self._sdr = None
+
+    def start(self, frame: bytes, air_mode: str) -> None:
+        from phy.gfsk2_tx_builder import build_gfsk2_tx_iq
+        import adi
+
+        iq_tx = build_gfsk2_tx_iq(
+            frame, mode=air_mode,
+            deviation_hz=self._deviation,
+            sample_rate=self._sr,
+            sps=self._sps, bt=self._bt,
+        )
+
+        self._sdr = adi.Pluto(uri=self._uri)
+        try:
+            self._sdr.tx_destroy_buffer()
+        except Exception:
+            pass
+        self._sdr.tx_lo                 = self._freq_hz
+        self._sdr.sample_rate           = int(self._sr)
+        self._sdr.tx_rf_bandwidth       = int(self._sr)
+        self._sdr.tx_hardwaregain_chan0 = -abs(self._atten)
+        self._sdr.tx_cyclic_buffer      = True
+        self._sdr.tx(iq_tx)
+
+    def stop(self) -> None:
+        if self._sdr is not None:
+            try:
+                self._sdr.tx_destroy_buffer()
+            except Exception:
+                pass
+            self._sdr = None
+
+
 def main() -> None:
     args = _parse_args()
 
@@ -58,12 +131,11 @@ def main() -> None:
     if args.demo:
         from visual_terminal import Dashboard
         dash = Dashboard(demo_mode=True)
-        dash.start()    # blocks
+        dash.start()
         return
 
     # ── Auto-detect PlutoSDR RX ────────────────────────────────────────────
     if not args.tx_only:
-        from pathlib import Path
         from config_manager import detect_pluto_rx_uri, save_rx_uri_to_config
 
         config_path = Path(args.config) if args.config else Path(__file__).parent / "config.json"
@@ -92,6 +164,7 @@ def main() -> None:
     from config_manager import load_config
     mgr  = load_config(args.config)
     plan = mgr.plan
+    phy  = mgr.phy_config
     print(plan.summary())
 
     # ── Queues ─────────────────────────────────────────────────────────────
@@ -112,13 +185,46 @@ def main() -> None:
                 "TX is disabled by default. "
                 "Use --test-tx-enable only in legal test conditions."
             )
-        from tx_signal_produce import PlutoTxProducer
-        tx = PlutoTxProducer(
-            mgr, key=args.key, simulate_arena=False,
-            test_tx_enabled=True,
-        )
-        tx.start()
-        print(f"[TX] Broadcasting key='{args.key}' on {plan.our_broadcast_freq_hz / 1e6:.3f} MHz")
+
+        # Dispatch by PHY mode
+        if phy.mode == "4rrcfsk_legacy":
+            from legacy_tx_signal_produce import PlutoTxProducer
+            tx = PlutoTxProducer(mgr, key=args.key, simulate_arena=False,
+                                 test_tx_enabled=True)
+            tx.start()
+            print(f"[TX] Legacy 4-RRC-FSK: key='{args.key}' on "
+                  f"{plan.our_broadcast_freq_hz / 1e6:.3f} MHz")
+        else:
+            # Default: 2-GFSK air-packet TX
+            # --freq overrides auto frequency
+            tx_freq_hz = (int(args.freq * 1e6) if args.freq is not None
+                          else int(plan.our_broadcast_freq_hz))
+
+            tx = _Gfsk2Tx(
+                uri=mgr.pluto_uri,
+                freq_hz=tx_freq_hz,
+                atten_db=mgr.tx_attenuation_db,
+                sr=phy.sample_rate,
+                deviation_hz=phy.deviation_hz,
+                bt=phy.bt,
+                sps=phy.sps,
+            )
+            frame = _build_rm_frame(args.key)
+            tx.start(frame, air_mode=args.air_mode)
+
+            print("=" * 58)
+            print("  2-GFSK Air-Link TX")
+            print("=" * 58)
+            print(f"  Key        : {args.key}")
+            print(f"  AC mode    : {args.air_mode}")
+            print(f"  Frequency  : {tx_freq_hz / 1e6:.3f} MHz")
+            print(f"  SR         : {phy.sample_rate / 1e6:.2f} MSPS"
+                  f"  SPS={phy.sps}  BT={phy.bt}")
+            print(f"  Deviation  : {phy.deviation_hz / 1e3:.1f} kHz")
+            print(f"  Pluto URI  : {mgr.pluto_uri}")
+            print(f"  TX Atten   : {mgr.tx_attenuation_db} dB")
+            print(f"  Frame      : {frame.hex(' ').upper()}")
+            print("=" * 58)
 
     # ── RX + DSP ───────────────────────────────────────────────────────────
     rx  = None
@@ -144,14 +250,13 @@ def main() -> None:
         print(f"[RX] Listening on {plan.center_freq_hz / 1e6:.3f} MHz  "
               f"(gain={mgr.rx_gain_db} dB, channelise={plan.channelize})")
 
-    # ── GUI event loop (blocks until window is closed) ─────────────────────
+    # ── GUI event loop ─────────────────────────────────────────────────────
     if dashboard is not None:
         try:
-            dashboard.start()       # returns only when user closes the window
+            dashboard.start()
         finally:
             _shutdown(rx, dsp, tx)
     else:
-        # Headless: run until Ctrl-C
         print("[INFO] Headless mode — press Ctrl-C to stop.")
         try:
             while True:
