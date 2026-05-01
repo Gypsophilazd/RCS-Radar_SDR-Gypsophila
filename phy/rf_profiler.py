@@ -33,13 +33,10 @@ class RfProfiler:
         Initial RX gain in dB.
     gain_mode : str
         "manual" (default) — no automatic gain changes.
-        "semi_auto" — evaluate every 2-5 s, adjust if needed.
+        "semi_auto_guarded" — evaluate every 3-5 s, require 2-window
+        confirmation, freeze if decoding reliably, clamp to range.
     window_s : float
-        Evaluation window in seconds for semi_auto (default 3.0).
-    iq_rms_target_lo : float
-        Low threshold for IQ RMS (default 0.05).
-    iq_rms_target_hi : float
-        High threshold for IQ RMS (default 0.50).
+        Evaluation window in seconds (default 4.0).
     gain_step_db : int
         Gain adjustment step size (default 5 dB).
     gain_min_db : int
@@ -52,9 +49,7 @@ class RfProfiler:
         self,
         gain_db: int = 20,
         gain_mode: str = "manual",
-        window_s: float = 3.0,
-        iq_rms_target_lo: float = 0.05,
-        iq_rms_target_hi: float = 0.50,
+        window_s: float = 4.0,
         gain_step_db: int = 5,
         gain_min_db: int = 0,
         gain_max_db: int = 50,
@@ -62,11 +57,13 @@ class RfProfiler:
         self._gain_db = gain_db
         self._gain_mode = gain_mode
         self._window_s = window_s
-        self._target_lo = iq_rms_target_lo
-        self._target_hi = iq_rms_target_hi
         self._gain_step = gain_step_db
         self._gain_min = gain_min_db
         self._gain_max = gain_max_db
+        # Guarded targets
+        self._target_lo = 0.03
+        self._target_hi = 0.30
+        self._rms_max_hi  = 1.0
 
         # IQ RMS stats over last N blocks
         self._iq_rms_samples: deque[float] = deque(maxlen=256)
@@ -82,10 +79,12 @@ class RfProfiler:
         self._decoded_frames: int = 0
         self._decode_times_s: list[float] = []  # timestamps of decoded frames
 
-        # Semi-auto state
+        # Guarded state
         self._last_eval_time = time.monotonic()
         self._last_gain_change_time = 0.0
         self._evaluation_count = 0
+        self._pending_delta: int = 0     # gain delta from last window
+        self._pending_count: int = 0     # consecutive windows with same delta
 
     # ── public ──────────────────────────────────────────────────────────────
 
@@ -151,6 +150,13 @@ class RfProfiler:
         """
         Process one IQ block.  Returns recommended gain delta in dB,
         or None if no change is needed / gain is manual.
+
+        semi_auto_guarded logic:
+        - Evaluate every window_s seconds.
+        - If frames are decoding reliably (>0.2/s): freeze gain.
+        - If RMS < 0.02 and frames/s low for 2 windows: gain += 5 dB.
+        - If RMS > 0.30 or max RMS > 1.0 for 2 windows: gain -= 5 dB.
+        - 2-window confirmation guard prevents oscillation.
         """
         import numpy as np
         rms = float(np.sqrt(np.mean(np.abs(iq) ** 2)))
@@ -160,7 +166,7 @@ class RfProfiler:
         if rms > self._iq_rms_max:
             self._iq_rms_max = rms
 
-        if self._gain_mode != "semi_auto":
+        if self._gain_mode not in ("semi_auto", "semi_auto_guarded"):
             return None
 
         now = time.monotonic()
@@ -170,26 +176,52 @@ class RfProfiler:
         self._last_eval_time = now
         self._evaluation_count += 1
         avg_rms = self.iq_rms_mean
+        max_rms = self.iq_rms_max
         frames_s = self.decoded_frames_per_sec
 
+        # ── Guard: freeze gain if decoding reliably ─────────────────────────
+        if frames_s > 0.2:
+            self._pending_delta = 0
+            self._pending_count = 0
+            return None
+
+        # ── Determine desired delta ──────────────────────────────────────────
         delta = 0
-        if avg_rms > self._target_hi:
+        if avg_rms > self._target_hi or max_rms > self._rms_max_hi:
             delta = -self._gain_step
-        elif avg_rms < self._target_lo and frames_s < 0.1:
+        elif avg_rms < 0.02 and frames_s < 0.1:
             delta = +self._gain_step
 
         if delta == 0:
+            self._pending_delta = 0
+            self._pending_count = 0
             return None
 
+        # ── 2-window confirmation guard ─────────────────────────────────────
+        if delta == self._pending_delta:
+            self._pending_count += 1
+        else:
+            self._pending_delta = delta
+            self._pending_count = 1
+
+        if self._pending_count < 2:
+            return None  # wait for confirmation
+
+        # ── Apply ───────────────────────────────────────────────────────────
         new_gain = max(self._gain_min,
                        min(self._gain_max, self._gain_db + delta))
         actual_delta = new_gain - self._gain_db
         if actual_delta == 0:
+            self._pending_delta = 0
+            self._pending_count = 0
             return None
 
         self._gain_db = new_gain
         self._last_gain_change_time = now
-        print(f"[GAIN] semi_auto: RMS={avg_rms:.4f}  frames/s={frames_s:.1f}  "
+        self._pending_delta = 0
+        self._pending_count = 0
+        print(f"[GAIN] guarded: RMS={avg_rms:.4f} max={max_rms:.4f}  "
+              f"frames/s={frames_s:.1f}  "
               f"gain {self._gain_db - actual_delta}→{self._gain_db} dB  "
               f"(Δ={actual_delta:+d} dB)")
         return actual_delta

@@ -71,6 +71,11 @@ class DSPProcessor:
         Enable Gaussian matched filter.
     decim_cutoff_hz : float or None
         Custom decimation LPF cutoff (None = auto from deviation).
+    on_gain_change : callable or None
+        Called as on_gain_change(new_gain_db) when semi_auto gain control
+        decides to change the RX gain.
+    gain_mode : str or None
+        "manual", "semi_auto_guarded".  Overrides config gain_mode if set.
     """
 
     def __init__(
@@ -87,6 +92,8 @@ class DSPProcessor:
         use_lpf: bool = False,
         use_mf: bool = False,
         decim_cutoff_hz: float | None = None,
+        on_gain_change: Callable[[int], None] | None = None,
+        gain_mode: str | None = None,
     ):
         self._cfg      = config
         self._q_in     = in_queue
@@ -193,10 +200,12 @@ class DSPProcessor:
             raise ValueError(f"Unknown phy_mode: {phy.mode!r}")
 
         # ── RF profiler (semi_auto gain support) ─────────────────────────────
+        _gm = gain_mode if gain_mode is not None else config.gain_mode
         self._profiler = RfProfiler(
             gain_db=config.rx_gain_db,
-            gain_mode=config.gain_mode,
+            gain_mode=_gm if _gm in ("manual", "semi_auto", "semi_auto_guarded") else "manual",
         )
+        self._on_gain_change = on_gain_change
         self._profiler_summary_blocks = 0
 
         self._stop_event = threading.Event()
@@ -227,6 +236,9 @@ class DSPProcessor:
 
         # Profiler: update IQ RMS stats, check for gain adjustments
         gain_delta = self._profiler.update(iq)
+        if gain_delta is not None and self._on_gain_change is not None:
+            # Forward to Pluto hardware via callback
+            self._on_gain_change(self._profiler.gain_db)
 
         # Forward raw IQ to GUI
         if self._q_iq is not None:

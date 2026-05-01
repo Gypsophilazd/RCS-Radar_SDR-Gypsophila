@@ -103,6 +103,14 @@ class PlutoRxDriver:
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
 
+    def set_rx_gain_db(self, gain_db: int) -> None:
+        """Update RX hardware gain at runtime (used by semi_auto gain control)."""
+        if self._sdr is not None:
+            try:
+                self._sdr.rx_hardwaregain_chan0 = gain_db
+            except Exception as exc:
+                print(f"[PlutoRxDriver] Failed to set gain to {gain_db} dB: {exc}")
+
     def stop(self) -> None:
         """Signal the capture thread to terminate and wait for it."""
         self._stop_event.set()

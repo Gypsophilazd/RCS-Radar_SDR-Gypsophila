@@ -64,6 +64,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Enable Gaussian matched filter")
     p.add_argument("--decim-cutoff-hz", type=float, default=None, metavar="HZ",
                    help="Override decimation LPF cutoff in Hz (default: auto from deviation)")
+    p.add_argument("--auto-rf-calibrate", type=float, default=None, metavar="SEC",
+                   help="Enable guarded semi-auto RX gain with N-second window")
     p.add_argument("--no-gui",   action="store_true")
     p.add_argument("--demo",     action="store_true")
     p.add_argument("--test-tx-enable", action="store_true",
@@ -291,6 +293,10 @@ def main() -> None:
         rx  = PlutoRxDriver(mgr, iq_queue,
                             freq_hz=rx_freq_override,
                             sample_rate_hz=rx_sr_override)
+        _rx_ref[0] = rx  # for gain callback
+        # ── Get RX ref for gain callback ───────────────────────────────────
+        _rx_ref = [None]  # filled after PlutoRxDriver is created
+
         dsp = DSPProcessor(
             config    = mgr,
             in_queue  = iq_queue,
@@ -304,7 +310,15 @@ def main() -> None:
             use_lpf=args.use_lpf,
             use_mf=args.use_mf,
             decim_cutoff_hz=args.decim_cutoff_hz,
+            gain_mode=("semi_auto_guarded"
+                       if args.auto_rf_calibrate is not None
+                       else None),
+            on_gain_change=(lambda g: _rx_ref[0].set_rx_gain_db(g)
+                            if _rx_ref[0] else None),
         )
+        if args.auto_rf_calibrate is not None:
+            print(f"[AUTO] RF calibrate: semi_auto_guarded, "
+                  f"window={args.auto_rf_calibrate:.1f}s")
         t_dsp = threading.Thread(target=dsp.run_forever, daemon=True, name="DSP")
         t_dsp.start()
         rx.start()
