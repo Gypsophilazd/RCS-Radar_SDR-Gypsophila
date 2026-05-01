@@ -55,7 +55,6 @@ class DSPProcessor:
     on_frame  : callback(dict) invoked in DSP thread for each decoded frame
     out_iq_q  : optional queue for raw IQ → GUI spectrum / waveform
     out_sym_q : optional queue for symbol values → GUI scatter panel
-    phy_mode  : "2gfsk" (default) or "4rrcfsk_legacy"
     """
 
     def __init__(
@@ -65,35 +64,35 @@ class DSPProcessor:
         on_frame: Callable[[dict], None],
         out_iq_q:  Optional["queue.Queue"] = None,
         out_sym_q: Optional["queue.Queue[np.ndarray]"] = None,
-        phy_mode: str = "2gfsk",
     ):
         self._cfg      = config
         self._q_in     = in_queue
         self._on_frame = on_frame
         self._q_iq     = out_iq_q
         self._q_sym    = out_sym_q
-        self._phy_mode = phy_mode
 
         plan          = config.plan
-        sr            = plan.sample_rate_hz
-        self._sr      = sr
+        phy           = config.phy_config
+        self._sr      = plan.sample_rate_hz
         self._centre_hz = float(plan.center_freq_hz)
+        self._phy_mode = phy.mode
 
         # ── Build modem chain by mode ───────────────────────────────────────
-        if phy_mode == "2gfsk":
+        if phy.mode == "2gfsk":
             # 2-GFSK chain: demod → deframer → reassembler → decode
             self._demod = GFSK2Demodulator(
-                sps=52,
-                bt=0.35,
-                span=4,
-                deviation_hz=250_000.0,    # will be overridden by PhyConfig in Phase 5
-                sample_rate=1_000_000.0,   # will be overridden by PhyConfig in Phase 5
+                sps=phy.sps,
+                bt=phy.bt,
+                span=phy.span,
+                deviation_hz=phy.deviation_hz,
+                sample_rate=phy.sample_rate,
                 channelizer_offset_hz=(
                     plan.broadcast_offset_hz if plan.channelize else None
                 ),
                 threshold_mode="zero",
+                sub_block_syms=phy.sub_block_syms,
             )
-            self._deframer = AirPacketDeframer(mode="both")
+            self._deframer = AirPacketDeframer(mode=phy.access_code_mode)
             self._reassembler = PayloadStreamReassembler()
             self._legacy_modem = None
 
@@ -105,7 +104,7 @@ class DSPProcessor:
             self._header_bits : int       = 0
             self._body_bits   : int       = 0
 
-        elif phy_mode == "4rrcfsk_legacy":
+        elif phy.mode == "4rrcfsk_legacy":
             self._legacy_modem = Legacy4RRCFSKModem(
                 sample_rate=sr,
                 baud_rate=250_000,

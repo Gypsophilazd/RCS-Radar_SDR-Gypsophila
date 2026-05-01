@@ -5,26 +5,30 @@ Module 1 — Configuration Manager
 RCS-Radar-SDR  RM2026 Arena System
 
 Reads config.json, resolves exact RF centre frequencies per
-RM2026 Rulebook V1.3.0, and emits a frozen FreqPlan dataclass
+RM2026 Rulebook, and emits frozen FreqPlan and PhyConfig dataclasses
 consumed by every downstream module.
 
-RM2026 Frequency Plan (Rulebook V1.3.0)
-────────────────────────────────────────────────────────────
-  Team  │ Broadcast    │ Jammer L1    │ Jammer L2    │ Jammer L3
-  Blue  │ 433.920 MHz  │ 434.920 MHz  │ 434.520 MHz  │ 433.920 MHz (= broadcast)
-  Red   │ 433.200 MHz  │ 432.200 MHz  │ 432.600 MHz  │ 433.200 MHz (= broadcast)
+RM2026 Official Frequency Plan
+─────────────────────────────────────────────────────────────
+  Channel            │ Freq (MHz) │ RF BW (MHz) │ Power   │ Sensitivity
+  ───────────────────┼────────────┼─────────────┼─────────┼───────────
+  Red broadcast       │ 433.20     │ 0.54        │ −60 dBm │ 1.5756
+  Red jammer L1       │ 432.20     │ 0.94        │ −10 dBm │ 2.8323
+  Red jammer L2       │ 432.50     │ 0.86        │ −10 dBm │ 2.5809
+  Red jammer L3       │ 432.80     │ 0.25        │ −10 dBm │ 0.6646
+  Blue broadcast      │ 433.92     │ 0.54        │ −60 dBm │ 1.5756
+  Blue jammer L1      │ 434.92     │ 0.94        │ −10 dBm │ 2.8323
+  Blue jammer L2      │ 434.62     │ 0.86        │ −10 dBm │ 2.5809
+  Blue jammer L3      │ 434.32     │ 0.25        │ −10 dBm │ 0.6646
+
+Sensitivity → deviation relationship
+────────────────────────────────────
+  sensitivity = 2 * pi * deviation / sample_rate
+  deviation = sensitivity * sample_rate / (2 * pi)
 
 Strategy: "listen to opponent"
   We are Red  → listen to Blue's broadcast + Blue's active jammer.
   We are Blue → listen to Red's broadcast  + Red's active jammer.
-
-Frequency centering
-───────────────────
-  Level 0  (no active jammer)  : centre on broadcast,  SR = 2.5 MSPS
-  Level 3  (jammer == broadcast): centre on broadcast,  SR = 2.5 MSPS
-  Level 1/2 (distinct channels) : centre = midpoint(broadcast, jammer)
-                                   SR = next_nice(2 × half_span × GUARD_FACTOR)
-                                   min SR = 3.0 MSPS (covers ±1 MHz span)
 
 CLI smoke test:
   python config_manager.py [path/to/config.json]
@@ -34,44 +38,97 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 
-# ─── RM2026 Frequency tables (Hz) ─────────────────────────────────────────────
+# ─── RM2026 Frequency tables (Hz) — official spec ────────────────────────────
 
 _BROADCAST: dict[str, float] = {
     "blue": 433_920_000.0,
     "red":  433_200_000.0,
 }
 
-# jammer_level 0 = no active jammer.
-# Level 3 jammer always equals the broadcast frequency (same channel).
 _JAMMERS: dict[str, dict[int, Optional[float]]] = {
     "blue": {
         0: None,
-        1: 434_920_000.0,   # +1.000 MHz from broadcast
-        2: 434_520_000.0,   # +0.600 MHz from broadcast
-        3: 433_920_000.0,   # same channel as broadcast
+        1: 434_920_000.0,
+        2: 434_620_000.0,
+        3: 434_320_000.0,
     },
     "red": {
         0: None,
-        1: 432_200_000.0,   # −1.000 MHz from broadcast
-        2: 432_600_000.0,   # −0.600 MHz from broadcast
-        3: 433_200_000.0,   # same channel as broadcast
+        1: 432_200_000.0,
+        2: 432_500_000.0,
+        3: 432_800_000.0,
     },
 }
 
+# Sensitivity and RF bandwidth per channel
+_SENSITIVITY: dict[str, float] = {
+    "broadcast": 1.5756,
+    "jammer_L1": 2.8323,
+    "jammer_L2": 2.5809,
+    "jammer_L3": 0.6646,
+}
+
+_RF_BW_HZ: dict[str, float] = {
+    "broadcast": 540_000.0,
+    "jammer_L1": 940_000.0,
+    "jammer_L2": 860_000.0,
+    "jammer_L3": 250_000.0,
+}
+
 # AD9363 / PlutoSDR constraints
-_PLUTO_MIN_SR_HZ = 521_000       # hardware minimum (AD9363 datasheet)
-_PLUTO_MAX_SR_HZ = 20_000_000    # practical FPGA DMA limit under Python
-_SR_STEP_HZ      = 500_000       # round up in 500 kHz increments for clean FIR designs
-_GUARD_FACTOR    = 1.6           # SR ≥ 2 × max_offset_from_centre × GUARD_FACTOR
-_FSK_BW_HZ       = 540_000       # occupied bandwidth of one 4-RRC-FSK channel
+_PLUTO_MIN_SR_HZ = 521_000
+_PLUTO_MAX_SR_HZ = 20_000_000
+_SR_STEP_HZ      = 500_000
+_GUARD_FACTOR    = 1.6
+_DEFAULT_2GFSK_SR = 1_000_000   # default RX sample rate for 2-GFSK mode
 
 
-# ─── Public dataclass ──────────────────────────────────────────────────────────
+# ─── Public dataclasses ────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class PhyConfig:
+    """
+    PHY-layer configuration for DSP processing mode selection.
+
+    Attributes
+    ----------
+    mode : str
+        "2gfsk" (default) or "4rrcfsk_legacy".
+    sample_rate : float
+        ADC sample rate in Hz.
+    sps : int
+        Samples per symbol.
+    bt : float
+        Gaussian bandwidth-time product (2-GFSK only).
+    span : int
+        Gaussian filter span in symbols (2-GFSK only).
+    deviation_hz : float
+        Peak frequency deviation in Hz.
+    sub_block_syms : int
+        Symbols between clock phase re-search.
+    score_mode : str
+        Clock recovery scoring function.
+    access_code_mode : str
+        "info", "jammer", or "both".
+    sensitivity : float
+        FM sensitivity for deviation computation.
+    """
+    mode: str = "2gfsk"
+    sample_rate: float = 1_000_000.0
+    sps: int = 52
+    bt: float = 0.35
+    span: int = 4
+    deviation_hz: float = 250_000.0
+    sub_block_syms: int = 512
+    score_mode: str = "gfsk2_variance"
+    access_code_mode: str = "both"
+    sensitivity: float = 1.5756
+
 
 @dataclass(frozen=True)
 class FreqPlan:
@@ -103,15 +160,14 @@ class FreqPlan:
     jammer_offset_hz    : float
     channelize          : bool
     our_broadcast_freq_hz : float   # own team's TX broadcast frequency (Hz)
+    broadcast_rf_bw_hz   : float   # RF bandwidth of broadcast signal
+    jammer_rf_bw_hz      : float   # RF bandwidth of active jammer signal
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
     def digital_lpf_cutoff_hz(self) -> float:
-        """
-        Suggested low-pass cut-off (Hz) for the broadcast channel filter when
-        channelising.  Half the FSK occupied bandwidth plus 20 % guard.
-        """
-        return (_FSK_BW_HZ / 2) * 1.2
+        """LPF cut-off for broadcast channel extraction (half BW + guard)."""
+        return (self.broadcast_rf_bw_hz / 2) * 1.2
 
     def summary(self) -> str:
         lines = [
@@ -164,6 +220,7 @@ class ConfigManager:
         self._path: Path  = Path(config_path) if config_path else self._DEFAULT_PATH
         self._raw:  dict  = {}
         self._plan: Optional[FreqPlan] = None
+        self._phy:  PhyConfig = PhyConfig()
 
     # ── public ───────────────────────────────────────────────────────────────
 
@@ -227,6 +284,11 @@ class ConfigManager:
             raise ValueError(f"rx_buf_size must be a power of 2, got {v}")
         return v
 
+    @property
+    def phy_config(self) -> PhyConfig:
+        """Resolved PHY-layer configuration."""
+        return self._phy
+
     # ── private ──────────────────────────────────────────────────────────────
 
     def _resolve(self) -> FreqPlan:
@@ -241,32 +303,62 @@ class ConfigManager:
                 f"target_jammer_level must be 0..3, got {level}"
             )
 
+        phy_mode = str(self._raw.get("phy_mode", "2gfsk")).lower().strip()
+
         opponent      = "blue" if our_color == "red" else "red"
         broadcast_hz  = _BROADCAST[opponent]
         jammer_hz     = _JAMMERS[opponent][level]
 
+        # Perc-channel RF bandwidths
+        bc_rf_bw  = _RF_BW_HZ["broadcast"]
+        jam_rf_bw = (_RF_BW_HZ.get(f"jammer_L{level}", bc_rf_bw)
+                     if jammer_hz is not None else 0.0)
+
         # ── Centre frequency and sample rate ────────────────────────────────
-        if jammer_hz is None or jammer_hz == broadcast_hz:
-            # Level 0 (no jammer) or Level 3 (jammer == broadcast): single channel.
+        if jammer_hz is None:
+            # Level 0: single channel, broadcast only.
             center_hz  = broadcast_hz
-            sr_hz      = 2_500_000          # 2.5 MSPS: comfortable for 250 kBaud FSK
+            sr_hz      = _DEFAULT_2GFSK_SR if phy_mode == "2gfsk" else 2_500_000
             bc_offset  = 0.0
             jam_offset = 0.0
             channelize = False
         else:
-            # Levels 1 or 2: two distinct channels.
-            # Place the LO midpoint between them so both sit symmetrically in band.
-            separation = abs(jammer_hz - broadcast_hz)   # 600 kHz (L2) or 1000 kHz (L1)
+            # Levels 1-3: two distinct channels (L3 is no longer == broadcast).
+            separation = abs(jammer_hz - broadcast_hz)
             center_hz  = (broadcast_hz + jammer_hz) / 2
-            bc_offset  = broadcast_hz - center_hz         # signed
-            jam_offset = jammer_hz    - center_hz         # signed
+            bc_offset  = broadcast_hz - center_hz
+            jam_offset = jammer_hz    - center_hz
 
-            # Each signal occupies ~540 kHz; its outermost edge from the LO is:
-            #   |offset| + FSK_BW/2
-            edge_hz = abs(bc_offset) + _FSK_BW_HZ / 2
+            edge_hz = abs(bc_offset) + bc_rf_bw / 2
             min_sr  = _next_pluto_sr(edge_hz * 2 * _GUARD_FACTOR)
-            sr_hz   = max(min_sr, 3_000_000)   # at least 3 MSPS for L1 headroom
+            sr_hz   = max(min_sr, 3_000_000)
             channelize = True
+
+        # ── Build PhyConfig ─────────────────────────────────────────────────
+        if phy_mode == "2gfsk":
+            # Compute deviation from broadcast sensitivity
+            sensitivity = _SENSITIVITY["broadcast"]
+            deviation = sensitivity * _DEFAULT_2GFSK_SR / (2.0 * math.pi)
+            self._phy = PhyConfig(
+                mode="2gfsk",
+                sample_rate=_DEFAULT_2GFSK_SR,
+                sps=52,
+                bt=0.35,
+                span=4,
+                deviation_hz=round(deviation, 1),
+                sub_block_syms=512,
+                score_mode="gfsk2_variance",
+                access_code_mode="both",
+                sensitivity=sensitivity,
+            )
+        else:
+            self._phy = PhyConfig(
+                mode="4rrcfsk_legacy",
+                sample_rate=float(sr_hz),
+                sps=sr_hz // 250_000,
+                deviation_hz=250_000.0,
+                score_mode="fsk4_energy",
+            )
 
         return FreqPlan(
             our_color             = our_color,
@@ -280,6 +372,8 @@ class ConfigManager:
             jammer_offset_hz      = jam_offset,
             channelize            = channelize,
             our_broadcast_freq_hz = _BROADCAST[our_color],
+            broadcast_rf_bw_hz    = bc_rf_bw,
+            jammer_rf_bw_hz       = jam_rf_bw,
         )
 
 

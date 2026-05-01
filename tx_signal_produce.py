@@ -84,16 +84,23 @@ class PlutoTxProducer:
         config: "ConfigManager",
         key: str = "RM2026",
         simulate_arena: bool = False,
+        test_tx_enabled: bool = False,
     ):
         self._cfg            = config
         self._key            = key
         self._simulate_arena = simulate_arena
+        self._test_tx_enabled = test_tx_enabled
         self._sdr            = None
 
     # ── public ───────────────────────────────────────────────────────────────
 
     def start(self) -> None:
         """Open Pluto, build IQ, and begin cyclic transmission."""
+        if not self._test_tx_enabled:
+            raise RuntimeError(
+                "TX is disabled by default. "
+                "Use --test-tx-enable only in legal test conditions."
+            )
         if not _PLUTO_AVAILABLE:
             raise RuntimeError("pyadi-iio not installed.  Run: pip install pyadi-iio")
         plan = self._cfg.plan

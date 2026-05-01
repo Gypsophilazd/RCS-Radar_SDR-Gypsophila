@@ -38,6 +38,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--key",      default="RM2026",  metavar="KEY")
     p.add_argument("--no-gui",   action="store_true")
     p.add_argument("--demo",     action="store_true")
+    p.add_argument("--test-tx-enable", action="store_true",
+                   help="Enable TX (disabled by default — use only in legal test conditions)")
     return p.parse_args()
 
 
@@ -105,8 +107,16 @@ def main() -> None:
     # ── TX ─────────────────────────────────────────────────────────────────
     tx = None
     if not args.rx_only:
+        if not args.test_tx_enable:
+            raise RuntimeError(
+                "TX is disabled by default. "
+                "Use --test-tx-enable only in legal test conditions."
+            )
         from tx_signal_produce import PlutoTxProducer
-        tx = PlutoTxProducer(mgr, key=args.key, simulate_arena=False)
+        tx = PlutoTxProducer(
+            mgr, key=args.key, simulate_arena=False,
+            test_tx_enabled=True,
+        )
         tx.start()
         print(f"[TX] Broadcasting key='{args.key}' on {plan.our_broadcast_freq_hz / 1e6:.3f} MHz")
 
