@@ -33,11 +33,12 @@ import numpy as np
 if TYPE_CHECKING:
     from config_manager import ConfigManager, FreqPlan
 
-from packet_decoder import decode_frame, crc8_rm
+from packet_decoder import decode_frame, crc8_rm, verify_frame
 from phy.gfsk2_modem import GFSK2Demodulator
 from phy.air_packet import AirPacketDeframer
 from phy.stream_reassembler import PayloadStreamReassembler
 from phy.legacy_4rrcfsk import Legacy4RRCFSKModem
+from phy.rf_profiler import RfProfiler
 
 # ── Maximum plausible DataLen ────────────────────────────────────────────────
 _MAX_DATA_LEN = 64   # CmdID(2) + max-payload(36) + CRC16(2) + margin
@@ -55,6 +56,7 @@ class DSPProcessor:
     on_frame  : callback(dict) invoked in DSP thread for each decoded frame
     out_iq_q  : optional queue for raw IQ → GUI spectrum / waveform
     out_sym_q : optional queue for symbol values → GUI scatter panel
+    rx_source : "broadcast" (default) or "jammer" — RX listen target
     """
 
     def __init__(
@@ -64,12 +66,14 @@ class DSPProcessor:
         on_frame: Callable[[dict], None],
         out_iq_q:  Optional["queue.Queue"] = None,
         out_sym_q: Optional["queue.Queue[np.ndarray]"] = None,
+        rx_source: str = "broadcast",
     ):
         self._cfg      = config
         self._q_in     = in_queue
         self._on_frame = on_frame
         self._q_iq     = out_iq_q
         self._q_sym    = out_sym_q
+        self._rx_source = rx_source
 
         plan          = config.plan
         phy           = config.phy_config
@@ -79,20 +83,31 @@ class DSPProcessor:
 
         # ── Build modem chain by mode ───────────────────────────────────────
         if phy.mode == "2gfsk":
+            # Select deviation and channelizer offset based on RX source
+            if rx_source == "jammer":
+                rx_dev = phy.jammer_deviation_hz
+                chan_offset = (plan.jammer_offset_hz
+                               if plan.channelize and plan.jammer_offset_hz != 0.0
+                               else None)
+                ac_mode = "jammer"  # listen for jammer AC when on jammer channel
+            else:
+                rx_dev = phy.deviation_hz
+                chan_offset = (plan.broadcast_offset_hz
+                               if plan.channelize else None)
+                ac_mode = phy.access_code_mode  # "both" by default
+
             # 2-GFSK chain: demod → deframer → reassembler → decode
             self._demod = GFSK2Demodulator(
                 sps=phy.sps,
                 bt=phy.bt,
                 span=phy.span,
-                deviation_hz=phy.deviation_hz,
+                deviation_hz=rx_dev,
                 sample_rate=phy.sample_rate,
-                channelizer_offset_hz=(
-                    plan.broadcast_offset_hz if plan.channelize else None
-                ),
+                channelizer_offset_hz=chan_offset,
                 threshold_mode="zero",
                 sub_block_syms=phy.sub_block_syms,
             )
-            self._deframer = AirPacketDeframer(mode=phy.access_code_mode)
+            self._deframer = AirPacketDeframer(mode=ac_mode)
             self._reassembler = PayloadStreamReassembler()
             self._legacy_modem = None
 
@@ -125,6 +140,13 @@ class DSPProcessor:
         else:
             raise ValueError(f"Unknown phy_mode: {phy.mode!r}")
 
+        # ── RF profiler (semi_auto gain support) ─────────────────────────────
+        self._profiler = RfProfiler(
+            gain_db=config.rx_gain_db,
+            gain_mode=config.gain_mode,
+        )
+        self._profiler_summary_blocks = 0
+
         self._stop_event = threading.Event()
 
     # ── public ───────────────────────────────────────────────────────────────
@@ -144,8 +166,15 @@ class DSPProcessor:
 
     # ── block pipeline ───────────────────────────────────────────────────────
 
+    @property
+    def profiler(self) -> RfProfiler:
+        return self._profiler
+
     def _process_block(self, iq: np.ndarray) -> None:
         iq = np.asarray(iq, dtype=np.complex64)
+
+        # Profiler: update IQ RMS stats, check for gain adjustments
+        gain_delta = self._profiler.update(iq)
 
         # Forward raw IQ to GUI
         if self._q_iq is not None:
@@ -159,6 +188,12 @@ class DSPProcessor:
         else:
             self._process_block_legacy(iq)
 
+        # Print profiler summary every ~8 blocks (~2 s at 1 MSPS 262144-sample blocks)
+        self._profiler_summary_blocks += 1
+        if self._profiler_summary_blocks % 8 == 0:
+            print(self._profiler.summary())
+            self._profiler.reset_counts()
+
     # ── 2-GFSK path ──────────────────────────────────────────────────────────
 
     def _process_block_2gfsk(self, iq: np.ndarray) -> None:
@@ -169,13 +204,26 @@ class DSPProcessor:
         # 2. Deframe: hunt access codes, extract 15-byte payloads
         payloads = self._deframer.push_bits(bits)
 
+        # Track AC hits and payloads
+        if payloads:
+            self._profiler.record_ac_hit()
+            self._profiler.record_payload()
+
         # 3. Reassemble payload stream into RM frames, decode, callback
         for payload in payloads:
             raw_frames = self._reassembler.push_payload(payload)
             for raw in raw_frames:
-                result = decode_frame(raw)
-                if result is not None:
-                    self._on_frame(result)
+                self._profiler.record_raw_frame()
+                crc_ok = verify_frame(raw)
+                self._profiler.record_crc(crc_ok)
+                if crc_ok:
+                    result = decode_frame(raw)
+                    if result is not None:
+                        self._profiler.record_decoded_frame()
+                        self._on_frame(result)
+                else:
+                    # Frame bytes exist but CRC failed
+                    pass
 
     # ── Legacy 4-RRC-FSK path ────────────────────────────────────────────────
 
@@ -183,17 +231,21 @@ class DSPProcessor:
         """Legacy 4-RRC-FSK: demodulate → FrameSync → decode."""
         bits = self._legacy_modem.push_iq(iq)
 
-        # Forward symbol values to GUI scatter panel (legacy modem provides
-        # symbols directly — we forward a placeholder empty array for now)
         if self._q_sym is not None and len(bits):
             try:
                 self._q_sym.put_nowait(np.array(bits[-128:], dtype=np.float32))
             except queue.Full:
                 pass
 
-        # Feed bits through frame-sync state machine
         for bit in bits:
             self._push_bit(bit)
+
+    def _on_legacy_frame(self, result: dict) -> None:
+        """Wrapper for legacy frame callback — records profiling stats."""
+        self._profiler.record_raw_frame()
+        self._profiler.record_crc(True)
+        self._profiler.record_decoded_frame()
+        self._on_frame(result)
 
     # ── Frame-sync state machine (legacy mode) ───────────────────────────────
 
@@ -234,5 +286,5 @@ class DSPProcessor:
             if self._body_bits == self._expected_body * 8:
                 result = decode_frame(bytes(self._frame_buf))
                 if result is not None:
-                    self._on_frame(result)
+                    self._on_legacy_frame(result)
                 self._frame_state = "HUNT"

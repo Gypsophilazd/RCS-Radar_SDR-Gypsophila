@@ -88,6 +88,54 @@ _GUARD_FACTOR    = 1.6
 _DEFAULT_2GFSK_SR = 1_000_000   # default RX sample rate for 2-GFSK mode
 
 
+# ─── Public helpers ────────────────────────────────────────────────────────────
+
+def get_broadcast_frequency(color: str) -> float:
+    """Return broadcast frequency in Hz for *color* ('red' or 'blue')."""
+    c = color.lower().strip()
+    if c not in _BROADCAST:
+        raise ValueError(f"Unknown color: {color!r}")
+    return _BROADCAST[c]
+
+
+def get_jammer_frequency(color: str, level: int) -> float:
+    """Return jammer frequency in Hz for *color* at *level* (1-3)."""
+    c = color.lower().strip()
+    if c not in _JAMMERS:
+        raise ValueError(f"Unknown color: {color!r}")
+    if level not in (1, 2, 3):
+        raise ValueError(f"Jammer level must be 1-3, got {level}")
+    return float(_JAMMERS[c][level])
+
+
+def get_sensitivity(kind: str = "broadcast", level: int = 0) -> float:
+    """
+    Return FM sensitivity for the given channel.
+
+    kind: "broadcast" or "jammer"
+    level: jammer level 1-3 (only used when kind="jammer")
+    """
+    if kind == "broadcast":
+        return _SENSITIVITY["broadcast"]
+    if kind == "jammer":
+        key = f"jammer_L{level}"
+        if key not in _SENSITIVITY:
+            raise ValueError(f"Unknown jammer level: L{level}")
+        return _SENSITIVITY[key]
+    raise ValueError(f"Unknown kind: {kind!r}")
+
+
+def get_deviation_hz(kind: str = "broadcast", level: int = 0,
+                     sample_rate: float = _DEFAULT_2GFSK_SR) -> float:
+    """
+    Return peak frequency deviation in Hz.
+
+    deviation = sensitivity * sample_rate / (2 * pi)
+    """
+    sens = get_sensitivity(kind, level)
+    return sens * sample_rate / (2.0 * math.pi)
+
+
 # ─── Public dataclasses ────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -108,7 +156,9 @@ class PhyConfig:
     span : int
         Gaussian filter span in symbols (2-GFSK only).
     deviation_hz : float
-        Peak frequency deviation in Hz.
+        Peak frequency deviation in Hz (broadcast default).
+    jammer_deviation_hz : float
+        Peak frequency deviation for jammer channel (per-level).
     sub_block_syms : int
         Symbols between clock phase re-search.
     score_mode : str
@@ -116,7 +166,7 @@ class PhyConfig:
     access_code_mode : str
         "info", "jammer", or "both".
     sensitivity : float
-        FM sensitivity for deviation computation.
+        FM sensitivity for deviation computation (broadcast).
     """
     mode: str = "2gfsk"
     sample_rate: float = 1_000_000.0
@@ -124,6 +174,7 @@ class PhyConfig:
     bt: float = 0.35
     span: int = 4
     deviation_hz: float = 250_000.0
+    jammer_deviation_hz: float = 250_000.0
     sub_block_syms: int = 512
     score_mode: str = "gfsk2_variance"
     access_code_mode: str = "both"
@@ -285,6 +336,16 @@ class ConfigManager:
         return v
 
     @property
+    def gain_mode(self) -> str:
+        """RX gain mode: 'manual' (default) or 'semi_auto'."""
+        return str(self._raw.get("gain_mode", "manual")).lower().strip()
+
+    @property
+    def rx_source(self) -> str:
+        """RX listen target: 'broadcast' (default) or 'jammer'."""
+        return str(self._raw.get("rx_source", "broadcast")).lower().strip()
+
+    @property
     def phy_config(self) -> PhyConfig:
         """Resolved PHY-layer configuration."""
         return self._phy
@@ -336,20 +397,21 @@ class ConfigManager:
 
         # ── Build PhyConfig ─────────────────────────────────────────────────
         if phy_mode == "2gfsk":
-            # Compute deviation from broadcast sensitivity
-            sensitivity = _SENSITIVITY["broadcast"]
-            deviation = sensitivity * _DEFAULT_2GFSK_SR / (2.0 * math.pi)
+            bc_dev = get_deviation_hz("broadcast", sample_rate=_DEFAULT_2GFSK_SR)
+            jam_dev = get_deviation_hz("jammer", level=max(level, 1),
+                                       sample_rate=_DEFAULT_2GFSK_SR)
             self._phy = PhyConfig(
                 mode="2gfsk",
                 sample_rate=_DEFAULT_2GFSK_SR,
                 sps=52,
                 bt=0.35,
                 span=4,
-                deviation_hz=round(deviation, 1),
+                deviation_hz=round(bc_dev, 1),
+                jammer_deviation_hz=round(jam_dev, 1),
                 sub_block_syms=512,
                 score_mode="gfsk2_variance",
                 access_code_mode="both",
-                sensitivity=sensitivity,
+                sensitivity=_SENSITIVITY["broadcast"],
             )
         else:
             self._phy = PhyConfig(

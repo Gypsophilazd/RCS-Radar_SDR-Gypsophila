@@ -65,8 +65,10 @@ Examples:
                    help="REQUIRED: enable TX (safety interlock)")
     p.add_argument("--key", default="RM2026", metavar="KEY",
                    help="6-char ASCII jammer key (default: RM2026)")
+    p.add_argument("--jammer-level", type=int, default=0, choices=[0, 1, 2, 3],
+                   help="Jammer level 1-3 (TX uses jammer freq/deviation)")
     p.add_argument("--freq", type=float, default=None, metavar="MHz",
-                   help="TX frequency in MHz (default: from config team_color)")
+                   help="TX frequency in MHz (override; deviation follows --jammer-level)")
     p.add_argument("--mode", default="info", choices=["info", "jammer"],
                    help="Access Code type: info or jammer (default: info)")
     p.add_argument("--config", default=None, metavar="PATH",
@@ -116,19 +118,33 @@ def main() -> None:
     cfg = _load_config(args.config)
     our_color = str(cfg.get("team_color", "red")).lower().strip()
 
-    # Load deviation from PhyConfig if available, else default
     try:
         from config_manager import load_config as load_mgr
+        from config_manager import (get_jammer_frequency, get_deviation_hz,
+                                     get_broadcast_frequency)
         mgr = load_mgr(args.config)
-        deviation_hz = mgr.phy_config.deviation_hz
+        phy = mgr.phy_config
     except Exception:
-        deviation_hz = 250_000.0
+        phy = None
 
-    # Determine frequency
+    jlevel = args.jammer_level
+
+    # Determine frequency and deviation
+    is_jammer_tx = (args.mode == "jammer" and jlevel > 0)
     if args.freq is not None:
         tx_freq_hz = int(args.freq * 1e6)
+        deviation_hz = (get_deviation_hz("jammer", level=jlevel, sample_rate=DEFAULT_SAMPLE_RATE)
+                        if is_jammer_tx
+                        else get_deviation_hz("broadcast", sample_rate=DEFAULT_SAMPLE_RATE))
+    elif is_jammer_tx:
+        tx_freq_hz = int(get_jammer_frequency(our_color, jlevel))
+        deviation_hz = get_deviation_hz("jammer", level=jlevel, sample_rate=DEFAULT_SAMPLE_RATE)
     else:
         tx_freq_hz = int(_BROADCAST_FREQ.get(our_color, 433_200_000))
+        deviation_hz = (phy.deviation_hz if phy
+                        else get_deviation_hz("broadcast", sample_rate=DEFAULT_SAMPLE_RATE))
+
+    tx_source = "jammer" if is_jammer_tx else "broadcast"
 
     # Determine URI
     tx_uri = args.uri or str(cfg.get("pluto_uri", "ip:192.168.2.1"))
@@ -140,15 +156,19 @@ def main() -> None:
     print("=" * 58)
     print("  2-GFSK Air-Link Test Transmitter")
     print("=" * 58)
-    print(f"  Key        : {args.key}")
-    print(f"  AC mode    : {args.mode}")
+    print(f"  TX source  : {tx_source}")
+    print(f"  Team color : {our_color.upper()}")
     print(f"  Frequency  : {tx_freq_hz / 1e6:.3f} MHz")
-    print(f"  SR         : {DEFAULT_SAMPLE_RATE / 1e6:.2f} MSPS"
-          f"  SPS={DEFAULT_SPS}  BT={DEFAULT_BT}")
+    print(f"  Air mode   : {args.mode}")
+    print(f"  Jammer lvl : {jlevel}")
+    print(f"  Sample rate: {DEFAULT_SAMPLE_RATE / 1e6:.2f} MSPS")
+    print(f"  SPS        : {DEFAULT_SPS}")
+    print(f"  BT         : {DEFAULT_BT}")
     print(f"  Deviation  : {deviation_hz / 1e3:.1f} kHz")
     print(f"  Pluto URI  : {tx_uri}")
     print(f"  TX Atten   : {tx_atten} dB")
     print(f"  Repeats    : {args.repeats}×")
+    print(f"  Key        : {args.key}")
     print("=" * 58)
 
     # ── Build frame and modulate ────────────────────────────────────────────
