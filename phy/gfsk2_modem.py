@@ -111,7 +111,7 @@ class GFSK2Demodulator:
     Parameters
     ----------
     sps : int
-        Samples per symbol (default 52).
+        Samples per symbol at demod_sample_rate (default 52).
     bt : float
         Gaussian bandwidth-time product (default 0.35).
     span : int
@@ -120,9 +120,15 @@ class GFSK2Demodulator:
         Peak frequency deviation in Hz.  Computed from sensitivity:
         deviation = sensitivity * sample_rate / (2*pi).
     sample_rate : float
-        ADC sample rate in Hz (default 1_000_000).
+        Demodulation sample rate in Hz — the rate at which FM discriminator
+        and clock recovery operate (default 1_000_000).
+    input_sample_rate : float
+        ADC input sample rate in Hz.  When different from *sample_rate*,
+        the modem applies a decimation stage after the channelizer.
+        Default: same as *sample_rate*.
     channelizer_offset_hz : float or None
-        If set, apply a phase-continuous frequency shift.
+        If set, apply a phase-continuous frequency shift at the input
+        sample rate BEFORE decimation.
     threshold_mode : str
         "zero" — slice at 0.0
         "running_median" — use running median of symbol values
@@ -136,7 +142,7 @@ class GFSK2Demodulator:
         Enable Gaussian matched filter after FM discriminator
         (default False — only needed for noisy channels).
     sub_block_syms : int
-        Symbols between clock phase re-search (default 256).
+        Symbols between clock phase re-search (default 512).
     """
 
     def __init__(
@@ -146,6 +152,7 @@ class GFSK2Demodulator:
         span: int = 4,
         deviation_hz: float = 250_000.0,
         sample_rate: float = 1_000_000.0,
+        input_sample_rate: float | None = None,
         channelizer_offset_hz: float | None = None,
         threshold_mode: str = "zero",
         use_lpf: bool = False,
@@ -158,17 +165,42 @@ class GFSK2Demodulator:
         self._bt = bt
         self._span = span
         self._deviation = float(deviation_hz)
-        self._sr = float(sample_rate)
+        self._demod_sr = float(sample_rate)        # rate after decimation
+        self._input_sr = float(input_sample_rate if input_sample_rate is not None
+                               else sample_rate)
         self._chan_offset = channelizer_offset_hz
         self._threshold_mode = threshold_mode
         self._sub_block_syms = sub_block_syms
         self._use_lpf = use_lpf
         self._use_mf = use_matched_filter
 
-        # ── LPF (optional) ────────────────────────────────────────────────────
+        # ── Decimation ────────────────────────────────────────────────────────
+        self._decim = round(self._input_sr / self._demod_sr)
+        if self._decim < 1:
+            raise ValueError(
+                f"input_sample_rate ({self._input_sr}) must be >= "
+                f"sample_rate ({self._demod_sr})"
+            )
+        self._needs_decim = self._decim > 1
+
+        # Anti-aliasing LPF for decimation: cutoff at 40% of demod Nyquist
+        # to allow for FIR transition band.  For GFSK with deviation ≤ 450 kHz
+        # this still passes the full modulated bandwidth.
+        if self._needs_decim:
+            nyq_input = self._input_sr / 2.0
+            cutoff_decim = self._demod_sr * 0.40
+            self._decim_lpf = firwin(
+                lpf_taps, cutoff_decim / nyq_input, window="hamming"
+            ).astype(np.float32)
+            self._decim_zi = np.zeros(lpf_taps - 1, dtype=np.complex64)
+        else:
+            self._decim_lpf = None
+            self._decim_zi = None
+
+        # ── LPF (optional, at demod rate) ─────────────────────────────────────
         if use_lpf:
             cutoff = lpf_cutoff_hz if lpf_cutoff_hz is not None else deviation_hz * 1.5
-            nyq = self._sr / 2.0
+            nyq = self._demod_sr / 2.0
             self._lpf_kernel = firwin(
                 lpf_taps, cutoff / nyq, window="hamming"
             ).astype(np.float32)
@@ -205,10 +237,14 @@ class GFSK2Demodulator:
         """
         Demodulate a block of complex IQ samples into bits.
 
+        When input_sample_rate > sample_rate, the modem channelises
+        (if configured), low-pass filters, and decimates to the
+        demodulation sample rate before FM discrimination.
+
         Parameters
         ----------
         iq : np.ndarray
-            Complex64 IQ samples.
+            Complex64 IQ samples at input_sample_rate.
 
         Returns
         -------
@@ -220,44 +256,54 @@ class GFSK2Demodulator:
             return []
 
         # 1. Optional channelizer — phase-continuous frequency shift
+        #    Applied at INPUT sample rate.
         if self._chan_offset is not None and abs(self._chan_offset) > 0.0:
             iq = self._apply_channelizer(iq)
 
-        # 2. Optional LPF — anti-alias / jammer suppression (STATEFUL)
+        # 2. Decimation: anti-alias LPF + downsample to demod rate
+        if self._needs_decim:
+            iq, self._decim_zi = lfilter(
+                self._decim_lpf, [1.0], iq, zi=self._decim_zi
+            )
+            iq = np.asarray(iq, dtype=np.complex64)
+            iq = iq[::self._decim].copy()
+
+        # 3. Optional LPF at demod rate
         if self._use_lpf:
             iq, self._lpf_zi = lfilter(
                 self._lpf_kernel, [1.0], iq, zi=self._lpf_zi
             )
             iq = np.asarray(iq, dtype=np.complex64)
 
-        # 3. FM discriminator — conjugate-delay (STATEFUL via prev_iq)
+        # 4. FM discriminator — conjugate-delay (STATEFUL via prev_iq)
+        #    Operates at _demod_sr.
         iq_prev = np.empty_like(iq)
         iq_prev[0] = self._prev_iq
         iq_prev[1:] = iq[:-1]
         self._prev_iq = complex(iq[-1])
 
         d_phase = np.angle(iq * np.conj(iq_prev))
-        freq_hz = d_phase * (self._sr / (2.0 * np.pi))
+        freq_hz = d_phase * (self._demod_sr / (2.0 * np.pi))
 
-        # 4. Normalize by deviation (scale so symbol levels are ~±1)
+        # 5. Normalize by deviation (scale so symbol levels are ~±1)
         fm = (freq_hz / self._deviation).astype(np.float32)
 
-        # 5. DC/bias removal — subtract running estimate
+        # 6. DC/bias removal — subtract running estimate
         block_dc = float(np.mean(fm))
         self._dc_est = ((1 - self._dc_alpha) * self._dc_est
                         + self._dc_alpha * block_dc)
         fm = fm - self._dc_est
 
-        # 6. Optional Gaussian matched filter (STATEFUL, overlap-save)
+        # 7. Optional Gaussian matched filter (STATEFUL, overlap-save)
         if self._use_mf:
             fm, self._gauss_zi = self._apply_gauss_filter(fm)
 
-        # 7. Block phase clock recovery → symbols
+        # 8. Block phase clock recovery → symbols
         symbols = self._clock.process(fm)
         if len(symbols) == 0:
             return []
 
-        # 8. Binary slicer → bits (1 symbol = 1 bit)
+        # 9. Binary slicer → bits (1 symbol = 1 bit)
         threshold = self._get_threshold(symbols)
         bits = [1 if s > threshold else 0 for s in symbols]
 
@@ -266,7 +312,7 @@ class GFSK2Demodulator:
     # ── private ───────────────────────────────────────────────────────────────
 
     def _apply_channelizer(self, iq: np.ndarray) -> np.ndarray:
-        """Phase-continuous frequency shift using running sample counter."""
+        """Phase-continuous frequency shift at INPUT sample rate."""
         n = len(iq)
         ns = np.arange(self._chan_n, self._chan_n + n, dtype=np.float64)
         self._chan_n += n
@@ -274,7 +320,7 @@ class GFSK2Demodulator:
             self._chan_n = 0
         offset = self._chan_offset
         shift = np.exp(
-            -1j * 2.0 * np.pi * offset * ns / self._sr
+            -1j * 2.0 * np.pi * offset * ns / self._input_sr
         ).astype(np.complex64)
         return iq * shift
 

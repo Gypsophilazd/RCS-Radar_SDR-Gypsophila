@@ -54,6 +54,8 @@ def _parse_args() -> argparse.Namespace:
                    help="TX frequency override in MHz (deviation follows --jammer-level)")
     p.add_argument("--rx-source", default=None, choices=["broadcast", "jammer"],
                    help="RX listen target (default: from config.json rx_source)")
+    p.add_argument("--rx-freq", type=float, default=None, metavar="MHz",
+                   help="RX direct-tune frequency override at 1 MSPS (bypasses channelizer)")
     p.add_argument("--no-gui",   action="store_true")
     p.add_argument("--demo",     action="store_true")
     p.add_argument("--test-tx-enable", action="store_true",
@@ -266,10 +268,19 @@ def main() -> None:
                 "Set target_jammer_level in config.json to 1, 2, or 3."
             )
 
+        # --rx-freq: direct-tune at 1 MSPS, bypass channelizer
+        rx_freq_override = None
+        rx_sr_override = None
+        if args.rx_freq is not None:
+            rx_freq_override = int(args.rx_freq * 1e6)
+            rx_sr_override = 1_000_000.0
+
         def on_frame(frame: dict) -> None:
             _on_frame(frame, dashboard)
 
-        rx  = PlutoRxDriver(mgr, iq_queue)
+        rx  = PlutoRxDriver(mgr, iq_queue,
+                            freq_hz=rx_freq_override,
+                            sample_rate_hz=rx_sr_override)
         dsp = DSPProcessor(
             config    = mgr,
             in_queue  = iq_queue,
@@ -277,11 +288,14 @@ def main() -> None:
             out_iq_q  = (dashboard._q_iq  if dashboard else None),
             out_sym_q = (dashboard._q_sym if dashboard else None),
             rx_source = rx_src,
+            direct_tune=(args.rx_freq is not None),
         )
         t_dsp = threading.Thread(target=dsp.run_forever, daemon=True, name="DSP")
         t_dsp.start()
         rx.start()
-        print(f"[RX] Listening on {plan.center_freq_hz / 1e6:.3f} MHz  "
+        rx_freq_mhz = (rx_freq_override / 1e6 if rx_freq_override
+                       else plan.center_freq_hz / 1e6)
+        print(f"[RX] Listening on {rx_freq_mhz:.3f} MHz  "
               f"(gain={mgr.rx_gain_db} dB, channelise={plan.channelize}, "
               f"source={rx_src})")
 

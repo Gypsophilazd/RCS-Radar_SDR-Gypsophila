@@ -57,6 +57,10 @@ class DSPProcessor:
     out_iq_q  : optional queue for raw IQ → GUI spectrum / waveform
     out_sym_q : optional queue for symbol values → GUI scatter panel
     rx_source : "broadcast" (default) or "jammer" — RX listen target
+    direct_tune : bool
+        If True, the SDR is directly tuned to the channel of interest
+        at 1 MSPS — no channelizer/decimation needed regardless of
+        plan.channelize.
     """
 
     def __init__(
@@ -67,6 +71,7 @@ class DSPProcessor:
         out_iq_q:  Optional["queue.Queue"] = None,
         out_sym_q: Optional["queue.Queue[np.ndarray]"] = None,
         rx_source: str = "broadcast",
+        direct_tune: bool = False,
     ):
         self._cfg      = config
         self._q_in     = in_queue
@@ -84,17 +89,21 @@ class DSPProcessor:
         # ── Build modem chain by mode ───────────────────────────────────────
         if phy.mode == "2gfsk":
             # Select deviation and channelizer offset based on RX source
+            # When direct_tune is True, the SDR is already tuned to the channel
+            # at 1 MSPS — no channelization/decimation needed.
             if rx_source == "jammer":
                 rx_dev = phy.jammer_deviation_hz
                 chan_offset = (plan.jammer_offset_hz
-                               if plan.channelize and plan.jammer_offset_hz != 0.0
+                               if (plan.channelize and not direct_tune
+                                   and plan.jammer_offset_hz != 0.0)
                                else None)
-                ac_mode = "jammer"  # listen for jammer AC when on jammer channel
+                ac_mode = "jammer"
             else:
                 rx_dev = phy.deviation_hz
                 chan_offset = (plan.broadcast_offset_hz
-                               if plan.channelize else None)
-                ac_mode = phy.access_code_mode  # "both" by default
+                               if (plan.channelize and not direct_tune)
+                               else None)
+                ac_mode = phy.access_code_mode
 
             # 2-GFSK chain: demod → deframer → reassembler → decode
             self._demod = GFSK2Demodulator(
@@ -103,6 +112,7 @@ class DSPProcessor:
                 span=phy.span,
                 deviation_hz=rx_dev,
                 sample_rate=phy.sample_rate,
+                input_sample_rate=float(plan.sample_rate_hz),
                 channelizer_offset_hz=chan_offset,
                 threshold_mode="zero",
                 sub_block_syms=phy.sub_block_syms,

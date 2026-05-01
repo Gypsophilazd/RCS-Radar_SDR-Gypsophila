@@ -61,11 +61,20 @@ class PlutoRxDriver:
     config  : loaded ConfigManager
     out_queue : queue.Queue[np.ndarray]  — receives complex64 arrays of
                 length config.rx_buf_size
+    freq_hz : float or None
+        Override RX centre frequency (Hz).  When None, uses plan.center_freq_hz.
+    sample_rate_hz : float or None
+        Override RX sample rate (Hz).  When None, uses plan.sample_rate_hz.
     """
 
-    def __init__(self, config: "ConfigManager", out_queue: "queue.Queue[np.ndarray]"):
+    def __init__(self, config: "ConfigManager",
+                 out_queue: "queue.Queue[np.ndarray]",
+                 freq_hz: float | None = None,
+                 sample_rate_hz: float | None = None):
         self._cfg   = config
         self._queue = out_queue
+        self._rx_freq_override = freq_hz
+        self._rx_sr_override  = sample_rate_hz
         self._sdr   = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -124,10 +133,17 @@ class PlutoRxDriver:
         plan = self._cfg.plan
         sdr  = adi.Pluto(uri=self._cfg.pluto_rx_uri)
 
+        rx_freq = (self._rx_freq_override
+                   if self._rx_freq_override is not None
+                   else plan.center_freq_hz)
+        rx_sr   = (self._rx_sr_override
+                   if self._rx_sr_override is not None
+                   else plan.sample_rate_hz)
+
         # ── RX configuration ──────────────────────────────────────────────
-        sdr.rx_lo                     = int(plan.center_freq_hz)
-        sdr.sample_rate               = int(plan.sample_rate_hz)
-        sdr.rx_rf_bandwidth           = int(plan.sample_rate_hz)   # match SR
+        sdr.rx_lo                     = int(rx_freq)
+        sdr.sample_rate               = int(rx_sr)
+        sdr.rx_rf_bandwidth           = int(rx_sr)   # match SR
         sdr.rx_buffer_size            = self._cfg.rx_buf_size
         sdr.gain_control_mode_chan0   = "manual"
         sdr.rx_hardwaregain_chan0     = self._cfg.rx_gain_db
